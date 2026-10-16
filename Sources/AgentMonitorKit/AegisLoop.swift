@@ -2,16 +2,19 @@ import Foundation
 
 /// The Claude ↔ Gemini review loop (first built for the Aegis project): its state file, review findings and pending changes.
 package final class AegisLoop {
-    static let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".aegis-loop")
+    package static let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".aegis-loop")
 
+    package let directory: URL
     private var snapshot: LoopSnapshot?
     private var tick = 0
 
-    package init() {}
+    package init(directory: URL = directory) {
+        self.directory = directory
+    }
 
     func refresh() -> LoopSnapshot? {
         tick += 1
-        let url = Self.directory.appendingPathComponent("state.json")
+        let url = directory.appendingPathComponent("state.json")
         guard let data = try? Data(contentsOf: url),
               let state = try? JSONDecoder().decode(LoopState.self, from: data) else { return nil }
         var next = snapshot ?? LoopSnapshot(state: state)

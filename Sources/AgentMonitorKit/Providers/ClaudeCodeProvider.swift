@@ -1,7 +1,7 @@
 import Foundation
 
 /// Claude Code sessions, read from the transcripts in ~/.claude/projects/<project>/<session>.jsonl.
-package final class ClaudeCodeProvider {
+package final class ClaudeCodeProvider: AgentProvider {
     /// Sessions whose transcript has not changed for this long are no longer shown.
     package static let window: TimeInterval = 30 * 60
 
@@ -10,7 +10,9 @@ package final class ClaudeCodeProvider {
     private var recent: [String: Date] = [:]
     private var lastScan = Date.distantPast
 
-    func poll(now: Date, processes: [ProcessEntry]) -> [AgentSession] {
+    package func poll(_ context: PollContext) -> [AgentSession] {
+        let now = context.now
+        let processes = context.processes
         if now.timeIntervalSince(lastScan) >= 5 {
             recent = FileScan.recentFiles(in: FileScan.subdirectories(of: root), ext: "jsonl", within: Self.window, now: now)
             transcripts = transcripts.filter { recent[$0.key] != nil }
@@ -52,9 +54,7 @@ package final class ClaudeTranscript {
     private var last: Last = .none
     private var lastText = ""
     private var lastEntryAt: Date?
-    private var activities: [Activity] = []
-    private var nextId = 0
-    private var openTools: [String: Int] = [:]
+    private let activityLog = TranscriptActivityLog()
 
     package init(path: String) {
         self.path = path
@@ -91,7 +91,7 @@ package final class ClaudeTranscript {
         guard age < ClaudeCodeProvider.window else { return nil }
 
         // Parallel tool calls finish one by one, so an unfinished one says more than the latest entry.
-        let running = openTools.isEmpty ? nil : activities.last(where: \.active)
+        let running = activityLog.runningActivity
         let state: AgentState
         let detail: String
         switch last {
@@ -113,10 +113,7 @@ package final class ClaudeTranscript {
             }
         }
 
-        var shown = Array(activities.suffix(30).reversed())
-        if state != .working {
-            for index in shown.indices { shown[index].active = false }
-        }
+        let shown = activityLog.visibleActivities(for: state)
         return AgentSession(
             id: "claude:\(sessionId)", kind: .claudeCode,
             title: title ?? Format.folderName(cwd) ?? String(sessionId.prefix(8)),
@@ -150,7 +147,7 @@ package final class ClaudeTranscript {
     private func handleUser(_ entry: [String: Any], at time: Date?) {
         let content = (entry["message"] as? [String: Any])?["content"]
         if let text = content as? String {
-            append(.prompt, "Prompt", text, active: false, at: time)
+            activityLog.append(.prompt, "Prompt", text, active: false, at: time)
             mark(.prompt, at: time)
             return
         }
@@ -158,11 +155,11 @@ package final class ClaudeTranscript {
         let results = blocks.filter { $0["type"] as? String == "tool_result" }
         if !results.isEmpty {
             for result in results {
-                if let id = result["tool_use_id"] as? String { closeTool(id, at: time) }
+                if let id = result["tool_use_id"] as? String { activityLog.closeTool(id, at: time) }
             }
             mark(.thinking, at: time)
         } else if let text = blocks.first(where: { $0["type"] as? String == "text" })?["text"] as? String {
-            append(.prompt, "Prompt", text, active: false, at: time)
+            activityLog.append(.prompt, "Prompt", text, active: false, at: time)
             mark(.prompt, at: time)
         }
     }
@@ -179,13 +176,13 @@ package final class ClaudeTranscript {
             case "tool_use":
                 let name = block["name"] as? String ?? "tool"
                 let (kind, label) = Activity.describe(claudeTool: name)
-                let id = append(kind, label, Activity.summary(of: block["input"] as? [String: Any] ?? [:]),
-                                active: true, at: time)
-                if let useId = block["id"] as? String { openTools[useId] = id }
+                let useId = block["id"] as? String
+                activityLog.append(kind, label, Activity.summary(of: block["input"] as? [String: Any] ?? [:]),
+                                   active: true, at: time, toolId: useId)
                 mark(.toolUse, at: time)
             case "text":
                 lastText = block["text"] as? String ?? ""
-                append(.response, "Menulis jawaban", lastText, active: false, at: time)
+                activityLog.append(.response, "Menulis jawaban", lastText, active: false, at: time)
                 mark(endsTurn ? .turnEnded : .thinking, at: time)
             case "thinking", "redacted_thinking":
                 mark(endsTurn ? .turnEnded : .thinking, at: time)
@@ -198,21 +195,5 @@ package final class ClaudeTranscript {
     private func mark(_ state: Last, at time: Date?) {
         last = state
         if let time { lastEntryAt = time }
-    }
-
-    @discardableResult
-    private func append(_ kind: Activity.Kind, _ title: String, _ detail: String, active: Bool, at time: Date?) -> Int {
-        nextId += 1
-        activities.append(Activity(id: nextId, kind: kind, title: title, detail: Format.snippet(detail, limit: 300),
-                                   active: active, startedAt: time ?? Date()))
-        if activities.count > 80 { activities.removeFirst(activities.count - 80) }
-        return nextId
-    }
-
-    private func closeTool(_ useId: String, at time: Date?) {
-        guard let id = openTools.removeValue(forKey: useId),
-              let index = activities.firstIndex(where: { $0.id == id }) else { return }
-        activities[index].active = false
-        if let time { activities[index].duration = time.timeIntervalSince(activities[index].startedAt) }
     }
 }

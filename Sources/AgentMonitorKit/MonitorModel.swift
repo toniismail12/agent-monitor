@@ -23,10 +23,11 @@ package final class MonitorModel: ObservableObject {
         didSet { UserDefaults.standard.set(notificationsOn, forKey: "notificationsOn") }
     }
 
-    private let claude = ClaudeCodeProvider()
-    private let codex = CodexProvider()
-    private let gemini = GeminiProvider()
-    private let aegis = AegisLoop()
+    private let engine: PollingEngine
+    private var isPolling = false
+    private var needsRepoll = false
+    private var repollFromFileEvent = false
+    private var watcher: FileWatcher?
     private let catalog = ModelCatalog()
     private let runner = LoopRunner()
     private let live: Bool
@@ -68,24 +69,43 @@ package final class MonitorModel: ObservableObject {
     }
 
     /// `live: false` polls once without timer or notifications, for `--dump`.
-    package init(live: Bool = true) {
+    package init(live: Bool = true, engine: PollingEngine = PollingEngine()) {
         self.live = live
+        self.engine = engine
         notificationsOn = UserDefaults.standard.object(forKey: "notificationsOn") as? Bool ?? true
         let stored = UserDefaults.standard.dictionary(forKey: "dismissedAgents") as? [String: Double] ?? [:]
         dismissed = stored.mapValues(Date.init(timeIntervalSince1970:))
         guard live else { return }
         Notifier.requestPermission()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in self.refresh() }
+        }
+        watcher = FileWatcher { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in self.refresh(fromFileEvent: true) }
         }
     }
 
     /// Prints what the panel would show, so detection can be checked from a terminal.
     package static func dump() {
         let model = MonitorModel(live: false)
-        model.refresh()
+        let engine = model.engine
+        let pollDone = DispatchSemaphore(value: 0)
+        final class ResultBox: @unchecked Sendable {
+            var result: PollResult?
+        }
+        let box = ResultBox()
+        Task.detached {
+            await engine.prepareOllama()
+            box.result = await engine.poll()
+            pollDone.signal()
+        }
+        pollDone.wait()
+        if let result = box.result {
+            model.applyPollResult(result)
+        }
         let relative = RelativeDateTimeFormatter()
         for agent in model.agents + model.dismissedAgents {
             let when = agent.lastActivity.map { relative.localizedString(for: $0, relativeTo: Date()) } ?? "-"
@@ -130,26 +150,42 @@ package final class MonitorModel: ObservableObject {
         done.wait()
     }
 
-    func refresh() {
-        let now = Date()
-        let processes = ProcessSnapshot.capture()
-        let snapshot = aegis.refresh()
-
-        var sessions = claude.poll(now: now, processes: processes)
-        sessions += codex.poll(now: now, processes: processes)
-        sessions += gemini.poll(now: now, processes: processes, loop: snapshot?.state)
-        sessions += PresenceProvider.poll(processes: processes)
-        // What needs the user first, then the most recently active.
-        sessions.sort {
-            ($0.state, $1.lastActivity ?? .distantPast) < ($1.state, $0.lastActivity ?? .distantPast)
+    func refresh(fromFileEvent: Bool = false) {
+        guard !isPolling else {
+            needsRepoll = true
+            if !fromFileEvent {
+                repollFromFileEvent = false
+            }
+            return
         }
+        isPolling = true
+        repollFromFileEvent = fromFileEvent
+        Task { [weak self] in
+            guard let self else { return }
+            while true {
+                let isFileEvent = self.repollFromFileEvent
+                self.needsRepoll = false
+                self.repollFromFileEvent = true
+                let result = await self.engine.poll(fromFileEvent: isFileEvent)
+                self.applyPollResult(result)
+                if !self.needsRepoll {
+                    self.isPolling = false
+                    break
+                }
+            }
+        }
+    }
+
+    private func applyPollResult(_ result: PollResult) {
+        let sessions = result.sessions
+        let snapshot = result.loop
 
         notifyChanges(sessions, loop: snapshot)
         all = sessions
         applyDismissals()
         if let state = snapshot?.state {
             if state != loop?.state { LoopStore.remember(state) }
-            if let project = state.project, let id = gemini.loopConversationId {
+            if let project = state.project, let id = result.loopConversationId {
                 LoopStore.setConversation(id, for: project)
             }
         }
@@ -157,7 +193,7 @@ package final class MonitorModel: ObservableObject {
         if live {
             refreshUsage()
             // A run the panel did not start (Claude's, or one left from before a relaunch) hands off here once it ends.
-            if let state = snapshot?.state, state.status == "gemini", !runner.isRunning, let outcome = gemini.loopOutcome {
+            if let state = snapshot?.state, state.status == "gemini", !runner.isRunning, let outcome = result.loopOutcome {
                 finishRound(state, status: outcome.status, error: outcome.error)
             }
         }

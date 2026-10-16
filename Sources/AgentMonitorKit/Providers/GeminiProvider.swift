@@ -1,7 +1,7 @@
 import Foundation
 
 /// Gemini: headless `agy -p` runs (with live activity when the run belongs to the Aegis loop) and the Gemini app.
-final class GeminiProvider {
+final class GeminiProvider: AgentProvider {
     private let reader = StreamReader()
     /// `agy` arguments never change for a pid, so they are read once; so is the project folder of a run.
     private var argumentsByPid: [Int: String] = [:]
@@ -11,7 +11,10 @@ final class GeminiProvider {
 
     var loopConversationId: String? { reader.conversationId }
 
-    func poll(now: Date, processes: [ProcessEntry], loop: LoopState?) -> [AgentSession] {
+    func poll(_ context: PollContext) -> [AgentSession] {
+        let now = context.now
+        let processes = context.processes
+        let loop = context.loop
         let loopLog = loop?.log
         if reader.path != loopLog { reader.reset(path: loopLog) }
         _ = reader.poll()

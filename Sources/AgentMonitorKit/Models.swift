@@ -1,6 +1,6 @@
 import Foundation
 
-package enum AgentKind: String {
+package enum AgentKind: String, Sendable {
     case claudeCode, codex, geminiCLI, geminiApp, copilot, claudeDesktop, chatGPT, ollama
 
     package var name: String {
@@ -30,7 +30,7 @@ package enum AgentKind: String {
 }
 
 /// Raw values give the display order: what needs the user comes first.
-package enum AgentState: Int, Comparable {
+package enum AgentState: Int, Comparable, Sendable {
     case waiting, working, failed, finished, idle, running
 
     package static func < (lhs: AgentState, rhs: AgentState) -> Bool { lhs.rawValue < rhs.rawValue }
@@ -48,7 +48,7 @@ package enum AgentState: Int, Comparable {
 }
 
 /// One agent session (or one running AI app) as shown in the panel.
-package struct AgentSession: Identifiable {
+package struct AgentSession: Identifiable, Sendable {
     package let id: String
     package let kind: AgentKind
     package var title: String
@@ -65,12 +65,44 @@ package struct AgentSession: Identifiable {
     package var activities: [Activity] = []
     package var logPath: String? = nil
 
+    package init(
+        id: String,
+        kind: AgentKind,
+        title: String,
+        project: String? = nil,
+        state: AgentState,
+        detail: String = "",
+        lastActivity: Date? = nil,
+        tokens: Int? = nil,
+        costUSD: Double? = nil,
+        cpu: Double? = nil,
+        memoryMB: Int? = nil,
+        model: String? = nil,
+        activities: [Activity] = [],
+        logPath: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.project = project
+        self.state = state
+        self.detail = detail
+        self.lastActivity = lastActivity
+        self.tokens = tokens
+        self.costUSD = costUSD
+        self.cpu = cpu
+        self.memoryMB = memoryMB
+        self.model = model
+        self.activities = activities
+        self.logPath = logPath
+    }
+
     /// Agents that are done or quiet can be closed from the panel; a working one stays in view.
     package var canDismiss: Bool { state != .working }
 }
 
-package struct Activity: Identifiable {
-    package enum Kind {
+package struct Activity: Identifiable, Sendable {
+    package enum Kind: Sendable {
         case prompt, read, search, edit, command, browse, response, thinking, other
 
         package var symbol: String {
@@ -186,7 +218,7 @@ struct AgentModels: Identifiable, Equatable {
 }
 
 /// Loop state that Claude and the panel write to ~/.aegis-loop/state.json at every hand-off.
-package struct LoopState: Codable, Equatable {
+package struct LoopState: Codable, Equatable, Sendable {
     package var project: String?
     package var phase: String?
     package var round: Int?
@@ -201,7 +233,7 @@ package struct LoopState: Codable, Equatable {
     }
 }
 
-package enum LoopStatus: Equatable {
+package enum LoopStatus: Equatable, Sendable {
     case gemini, claude, idle, done, blocked, none
 
     package init(_ raw: String?) {
@@ -252,13 +284,13 @@ package enum LoopStatus: Equatable {
     }
 }
 
-package struct ChangedFile: Identifiable, Equatable {
+package struct ChangedFile: Identifiable, Equatable, Sendable {
     package var id: String { path }
     package let status: String
     package let path: String
 }
 
-package struct ReviewCounts: Equatable {
+package struct ReviewCounts: Equatable, Sendable {
     package var open = 0
     package var fixed = 0
     package var rejected = 0
@@ -270,7 +302,7 @@ package struct ReviewCounts: Equatable {
     }
 }
 
-package struct LoopSnapshot: Equatable {
+package struct LoopSnapshot: Equatable, Sendable {
     package var state: LoopState
     package var review = ReviewCounts()
     package var changes: [ChangedFile] = []

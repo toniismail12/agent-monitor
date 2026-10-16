@@ -1,7 +1,7 @@
 import Foundation
 
 /// Codex sessions, read from ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
-final class CodexProvider {
+final class CodexProvider: AgentProvider {
     private let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
     private var transcripts: [String: CodexTranscript] = [:]
     private var recent: [String: Date] = [:]
@@ -14,7 +14,9 @@ final class CodexProvider {
         return formatter
     }()
 
-    func poll(now: Date, processes: [ProcessEntry]) -> [AgentSession] {
+    func poll(_ context: PollContext) -> [AgentSession] {
+        let now = context.now
+        let processes = context.processes
         if now.timeIntervalSince(lastScan) >= 5 {
             let days = [now, now.addingTimeInterval(-86_400)].map { root.appendingPathComponent(Self.dayPath.string(from: $0)) }
             recent = FileScan.recentFiles(in: days, ext: "jsonl", within: ClaudeCodeProvider.window, now: now)
@@ -58,9 +60,7 @@ package final class CodexTranscript {
     private var last: Last = .none
     private var lastText = ""
     private var lastEntryAt: Date?
-    private var activities: [Activity] = []
-    private var nextId = 0
-    private var openCalls: [String: Int] = [:]
+    private let activityLog = TranscriptActivityLog()
 
     package init(path: String) {
         self.path = path
@@ -96,10 +96,7 @@ package final class CodexTranscript {
             state = .idle
             detail = ""
         }
-        var shown = Array(activities.suffix(30).reversed())
-        if state != .working {
-            for index in shown.indices { shown[index].active = false }
-        }
+        let shown = activityLog.visibleActivities(for: state)
         return AgentSession(
             id: "codex:\(sessionId)", kind: .codex, title: Format.folderName(cwd) ?? "Codex",
             project: cwd, state: state, detail: detail, lastActivity: lastAt,
@@ -128,7 +125,7 @@ package final class CodexTranscript {
     private func handleEvent(_ payload: [String: Any], at time: Date?) {
         switch payload["type"] as? String {
         case "task_started", "user_message":
-            if let text = payload["message"] as? String { append(.prompt, "Prompt", text, active: false, at: time) }
+            if let text = payload["message"] as? String { activityLog.append(.prompt, "Prompt", text, active: false, at: time) }
             mark(.working, at: time)
         case "token_count":
             let usage = (payload["info"] as? [String: Any])?["total_token_usage"] as? [String: Any]
@@ -149,11 +146,11 @@ package final class CodexTranscript {
         case "custom_tool_call", "function_call":
             let name = payload["name"] as? String ?? "tool"
             let input = payload["input"] as? String ?? payload["arguments"] as? String ?? ""
-            let id = append(.command, "Menjalankan", Self.commandSummary(input), active: true, at: time)
-            if let callId = payload["call_id"] as? String { openCalls[callId] = id }
+            let callId = payload["call_id"] as? String
+            activityLog.append(.command, "Menjalankan", Self.commandSummary(input), active: true, at: time, toolId: callId)
             mark(.toolCall(name), at: time)
         case "custom_tool_call_output", "function_call_output":
-            if let callId = payload["call_id"] as? String { closeCall(callId, at: time) }
+            if let callId = payload["call_id"] as? String { activityLog.closeTool(callId, at: time) }
             mark(.working, at: time)
         case "message":
             guard payload["role"] as? String == "assistant",
@@ -161,7 +158,7 @@ package final class CodexTranscript {
             let text = blocks.compactMap { $0["text"] as? String }.joined(separator: " ")
             if !text.isEmpty {
                 lastText = text
-                append(.response, "Menulis jawaban", text, active: false, at: time)
+                activityLog.append(.response, "Menulis jawaban", text, active: false, at: time)
             }
         case "reasoning":
             mark(.working, at: time)
@@ -184,21 +181,5 @@ package final class CodexTranscript {
     private func mark(_ state: Last, at time: Date?) {
         last = state
         if let time { lastEntryAt = time }
-    }
-
-    @discardableResult
-    private func append(_ kind: Activity.Kind, _ title: String, _ detail: String, active: Bool, at time: Date?) -> Int {
-        nextId += 1
-        activities.append(Activity(id: nextId, kind: kind, title: title, detail: Format.snippet(detail, limit: 300),
-                                   active: active, startedAt: time ?? Date()))
-        if activities.count > 80 { activities.removeFirst(activities.count - 80) }
-        return nextId
-    }
-
-    private func closeCall(_ callId: String, at time: Date?) {
-        guard let id = openCalls.removeValue(forKey: callId),
-              let index = activities.firstIndex(where: { $0.id == id }) else { return }
-        activities[index].active = false
-        if let time { activities[index].duration = time.timeIntervalSince(activities[index].startedAt) }
     }
 }

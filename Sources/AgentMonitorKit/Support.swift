@@ -203,12 +203,20 @@ package final class JSONLTail {
     }
 }
 
-struct ProcessEntry {
-    let pid: Int
-    let elapsed: String
-    let cpu: Double
-    let memoryMB: Int
-    let path: String
+package struct ProcessEntry: Sendable {
+    package let pid: Int
+    package let elapsed: String
+    package let cpu: Double
+    package let memoryMB: Int
+    package let path: String
+
+    package init(pid: Int = 0, elapsed: String = "", cpu: Double = 0, memoryMB: Int = 0, path: String) {
+        self.pid = pid
+        self.elapsed = elapsed
+        self.cpu = cpu
+        self.memoryMB = memoryMB
+        self.path = path
+    }
 }
 
 enum ProcessSnapshot {

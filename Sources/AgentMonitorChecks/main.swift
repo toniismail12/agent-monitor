@@ -1,6 +1,8 @@
 import Foundation
 import AgentMonitorKit
 
+setvbuf(stdout, nil, _IOLBF, 0)
+
 // MARK: - Test Framework Helpers
 
 private var totalAssertions = 0
@@ -27,6 +29,21 @@ private func runSuite(_ name: String, _ body: () throws -> Void) {
     print("▶ Menguji \(name)...")
     do {
         try body()
+        if failedAssertions == startFailures {
+            print("  ✓ \(name): Lolos")
+        }
+    } catch {
+        failedAssertions += 1
+        print("  ❌ Exception tidak terduga pada \(name): \(error)")
+    }
+}
+
+@MainActor
+private func runSuiteAsync(_ name: String, _ body: () async throws -> Void) async {
+    let startFailures = failedAssertions
+    print("▶ Menguji \(name)...")
+    do {
+        try await body()
         if failedAssertions == startFailures {
             print("  ✓ \(name): Lolos")
         }
@@ -397,6 +414,340 @@ func testAegisLoopAndReview() throws {
     checkEqual(snapshot.subtitle, "Tahap 0 · Putaran 1 — Tahap 0 persiapan test", "Subtitle LoopSnapshot diformat rapi")
 }
 
+func testTranscriptActivityLog() {
+    // 1. Batas 80: aktivitas tertua dibuang dan id tetap berurutan
+    let log80 = TranscriptActivityLog()
+    for i in 1...85 {
+        let id = log80.append(.command, "Aktivitas \(i)", "detail \(i)")
+        checkEqual(id, i, "ID aktivitas bertambah berurutan dari 1 hingga 85")
+    }
+    checkEqual(log80.activities.count, 80, "TranscriptActivityLog membatasi riwayat maksimal 80 aktivitas")
+    checkEqual(log80.activities.first?.id, 6, "Aktivitas tertua dibuang (id 1-5 dibuang, dimulai dari 6)")
+    checkEqual(log80.activities.last?.id, 85, "Aktivitas terbaru adalah id 85")
+
+    // 2. Detail dipangkas 300 karakter
+    let longDetail = String(repeating: "x", count: 350)
+    let logSnippet = TranscriptActivityLog()
+    logSnippet.append(.prompt, "Prompt", longDetail)
+    if let act = logSnippet.activities.first {
+        checkEqual(act.detail.count, 301, "Detail dipangkas menjadi 300 karakter ditambah elipsis (total 301 karakter)")
+        check(act.detail.hasSuffix("…"), "Detail yang dipangkas diakhiri karakter elipsis")
+        checkEqual(act.detail, String(repeating: "x", count: 300) + "…", "Isi detail tepat 300 karakter awal diikuti elipsis")
+    }
+
+    // 3. Menutup id yang tidak dikenal tidak mengubah apa pun
+    let logUnknown = TranscriptActivityLog()
+    let knownTime = Date(timeIntervalSince1970: 1000)
+    logUnknown.append(.command, "Tool", "arg", active: true, at: knownTime, toolId: "call_known")
+    checkEqual(logUnknown.openTools.count, 1, "openTools mencatat 1 tool terbuka")
+    logUnknown.closeTool("call_unknown", at: knownTime.addingTimeInterval(5))
+    checkEqual(logUnknown.openTools.count, 1, "Menutup id tidak dikenal tidak mengubah openTools")
+    checkEqual(logUnknown.activities.first?.active, true, "Menutup id tidak dikenal tidak mengubah status active")
+    checkEqual(logUnknown.activities.first?.duration, nil, "Menutup id tidak dikenal tidak mengubah duration")
+
+    // 4. Menutup id yang sama dua kali hanya berlaku sekali, dan durasinya tidak berubah
+    let logDuplicate = TranscriptActivityLog()
+    let startTime = Date(timeIntervalSince1970: 2000)
+    logDuplicate.append(.command, "Tool", "arg", active: true, at: startTime, toolId: "call_duplicate")
+    let closeTime1 = startTime.addingTimeInterval(2.5)
+    logDuplicate.closeTool("call_duplicate", at: closeTime1)
+    checkEqual(logDuplicate.activities.first?.active, false, "Penutupan pertama mengubah active menjadi false")
+    checkEqual(logDuplicate.activities.first?.duration, 2.5, "Penutupan pertama menghitung durasi 2.5 detik")
+    checkEqual(logDuplicate.openTools.count, 0, "Penutupan pertama menghapus id dari openTools")
+
+    let closeTime2 = startTime.addingTimeInterval(10.0)
+    logDuplicate.closeTool("call_duplicate", at: closeTime2)
+    checkEqual(logDuplicate.activities.first?.active, false, "Penutupan kedua mempertahankan active == false")
+    checkEqual(logDuplicate.activities.first?.duration, 2.5, "Penutupan kedua tidak mengubah durasi yang telah dihitung sebelumnya")
+
+    // 5. Daftar tampil: 30 terbaru, terbalik, dan active dipaksa false kalau tidak .working
+    let logDisplay = TranscriptActivityLog()
+    for i in 1...40 {
+        logDisplay.append(.command, "Tool \(i)", "detail \(i)", active: true)
+    }
+
+    // Saat state .working: 30 terbaru, terbalik, active tetap true
+    let workingVisible = logDisplay.visibleActivities(for: .working)
+    checkEqual(workingVisible.count, 30, "Daftar tampil berisi tepat 30 aktivitas terbaru")
+    checkEqual(workingVisible.first?.title, "Tool 40", "Aktivitas pertama pada daftar tampil adalah yang terbaru (Tool 40)")
+    checkEqual(workingVisible.last?.title, "Tool 11", "Aktivitas terakhir pada daftar tampil adalah Tool 11")
+    checkEqual(workingVisible.first?.active, true, "Saat .working, aktivitas aktif mempertahankan active == true")
+
+    // Saat state bukan .working (misal .waiting atau .idle): 30 terbaru, terbalik, active dipaksa false
+    let waitingVisible = logDisplay.visibleActivities(for: .waiting)
+    checkEqual(waitingVisible.count, 30, "Daftar tampil saat bukan .working tetap berisi 30 aktivitas")
+    checkEqual(waitingVisible.first?.title, "Tool 40", "Urutan tetap terbalik (Tool 40 di awal)")
+    checkEqual(waitingVisible.first?.active, false, "Saat bukan .working, aktivitas aktif dipaksa active == false")
+    check(waitingVisible.allSatisfy { !$0.active }, "Seluruh aktivitas pada daftar tampil bukan .working memiliki active == false")
+    checkEqual(logDisplay.activities.last?.active, true, "Log internal tetap mempertahankan status active asli")
+}
+
+func testPresenceProvider() {
+    let provider = PresenceProvider()
+    let processes = [
+        ProcessEntry(pid: 101, elapsed: "01:23", cpu: 12.5, memoryMB: 150, path: "/Applications/Claude.app/Contents/MacOS/Claude"),
+        ProcessEntry(pid: 102, elapsed: "01:20", cpu: 2.5, memoryMB: 50, path: "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"),
+        ProcessEntry(pid: 201, elapsed: "10:00", cpu: 0.1, memoryMB: 20, path: "/usr/bin/login")
+    ]
+    let context = PollContext(now: Date(), processes: processes)
+    let sessions = provider.poll(context)
+
+    checkEqual(sessions.count, 1, "PresenceProvider mendeteksi tepat 1 sesi untuk Claude desktop")
+    if let session = sessions.first {
+        checkEqual(session.id, "app:claudeDesktop", "ID sesi sesuai signature claudeDesktop")
+        checkEqual(session.kind, .claudeDesktop, "AgentKind adalah .claudeDesktop")
+        checkEqual(session.state, .running, "Status sesi adalah .running")
+        checkEqual(session.title, "Aplikasi desktop", "Judul sesi adalah 'Aplikasi desktop'")
+        checkEqual(session.detail, "Berjalan", "Detail sesi adalah 'Berjalan'")
+        checkEqual(session.cpu, 15.0, "CPU kedua proses dijumlahkan (12.5 + 2.5 = 15.0)")
+        checkEqual(session.memoryMB, 200, "Memori kedua proses dijumlahkan (150 + 50 = 200)")
+    }
+}
+
+func testOllamaParsing() {
+    // Ada model: daftar nama digabung dengan koma
+    let jsonWithModels = """
+    {"models": [{"name": "qwen2.5-coder:7b"}, {"name": "llama3.2:3b"}]}
+    """.data(using: .utf8)!
+    let resultWithModels = PresenceProvider.parseOllamaModels(jsonWithModels)
+    checkEqual(resultWithModels, "Model aktif: qwen2.5-coder:7b, llama3.2:3b", "Parsing ada model menghasilkan 'Model aktif: a, b'")
+
+    // Daftar kosong: string keterangan kosong
+    let jsonEmpty = """
+    {"models": []}
+    """.data(using: .utf8)!
+    let resultEmpty = PresenceProvider.parseOllamaModels(jsonEmpty)
+    checkEqual(resultEmpty, "Tidak ada model dimuat", "Daftar model kosong menghasilkan 'Tidak ada model dimuat'")
+
+    // JSON rusak atau tidak sesuai schema: nil
+    let corruptJSON = "bukan json valid".data(using: .utf8)!
+    checkEqual(PresenceProvider.parseOllamaModels(corruptJSON), nil, "JSON rusak menghasilkan nil")
+
+    let missingModelsField = "{\"status\": \"ok\"}".data(using: .utf8)!
+    checkEqual(PresenceProvider.parseOllamaModels(missingModelsField), nil, "JSON tanpa properti models menghasilkan nil")
+}
+
+private final class MockProvider: AgentProvider, @unchecked Sendable {
+    let sessionsToReturn: [AgentSession]
+    var receivedContext: PollContext?
+
+    init(sessions: [AgentSession] = []) {
+        self.sessionsToReturn = sessions
+    }
+
+    func poll(_ context: PollContext) -> [AgentSession] {
+        self.receivedContext = context
+        return sessionsToReturn
+    }
+}
+
+@MainActor
+func testPollingEngine() async {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let s1 = AgentSession(
+        id: "s1", kind: .claudeCode, title: "Sesi 1",
+        state: .working, detail: "Working 10s ago",
+        lastActivity: now.addingTimeInterval(-10)
+    )
+    let s2 = AgentSession(
+        id: "s2", kind: .claudeCode, title: "Sesi 2",
+        state: .waiting, detail: "Waiting 20s ago",
+        lastActivity: now.addingTimeInterval(-20)
+    )
+    let s3 = AgentSession(
+        id: "s3", kind: .geminiCLI, title: "Sesi 3",
+        state: .working, detail: "Working 5s ago",
+        lastActivity: now.addingTimeInterval(-5)
+    )
+    let s4 = AgentSession(
+        id: "s4", kind: .codex, title: "Sesi 4",
+        state: .idle, detail: "Idle now",
+        lastActivity: now
+    )
+
+    let mock1 = MockProvider(sessions: [s1, s2])
+    let mock2 = MockProvider(sessions: [s3, s4])
+
+    let syntheticProcesses = [
+        ProcessEntry(pid: 999, elapsed: "00:05", cpu: 1.0, memoryMB: 50, path: "/usr/local/bin/dummy")
+    ]
+
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("aegis-test-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let loopJSON = """
+    {"project": "/Users/dev/contoh-proyek", "round": 1, "status": "gemini", "note": "Testing"}
+    """.data(using: .utf8)!
+    try? loopJSON.write(to: tempDir.appendingPathComponent("state.json"))
+
+    let aegis = AegisLoop(directory: tempDir)
+
+    let engine = PollingEngine(
+        providers: [mock1, mock2],
+        processSource: { syntheticProcesses },
+        aegis: aegis
+    )
+
+    let result = await engine.poll(now: now)
+
+    // Sesi digabung dari semua provider dan diurutkan:
+    // .waiting sebelum .working; untuk state yang sama, lastActivity terbaru lebih dulu; lalu .idle
+    checkEqual(result.sessions.count, 4, "Sesi digabung dari semua provider (total 4)")
+    checkEqual(result.sessions[0].id, "s2", "Sesi 1 adalah .waiting (s2)")
+    checkEqual(result.sessions[1].id, "s3", "Sesi 2 adalah .working terbaru (s3, -5s)")
+    checkEqual(result.sessions[2].id, "s1", "Sesi 3 adalah .working lebih lama (s1, -10s)")
+    checkEqual(result.sessions[3].id, "s4", "Sesi 4 adalah .idle (s4)")
+
+    // Setiap provider menerima now, processes, dan loop yang sama
+    check(mock1.receivedContext != nil, "Provider 1 menerima context")
+    check(mock2.receivedContext != nil, "Provider 2 menerima context")
+
+    if let c1 = mock1.receivedContext, let c2 = mock2.receivedContext {
+        checkEqual(c1.now, now, "Provider 1 menerima now yang tepat")
+        checkEqual(c2.now, now, "Provider 2 menerima now yang sama")
+
+        checkEqual(c1.processes.count, 1, "Provider 1 menerima daftar processes")
+        checkEqual(c1.processes.first?.pid, 999, "Provider 1 menerima process dengan PID 999")
+        checkEqual(c2.processes.count, 1, "Provider 2 menerima daftar processes yang sama")
+        checkEqual(c2.processes.first?.pid, 999, "Provider 2 menerima process dengan PID 999")
+
+        checkEqual(c1.loop?.project, "/Users/dev/contoh-proyek", "Provider 1 menerima loop state project")
+        checkEqual(c2.loop?.project, "/Users/dev/contoh-proyek", "Provider 2 menerima loop state project yang sama")
+        checkEqual(c1.loop?.status, "gemini", "Provider 1 menerima loop status 'gemini'")
+        checkEqual(c2.loop?.status, "gemini", "Provider 2 menerima loop status 'gemini'")
+    }
+
+    // Uji penggunaan ulang snapshot proses:
+    final class ProcessCounter: @unchecked Sendable {
+        var count = 0
+        func next() -> [ProcessEntry] {
+            count += 1
+            return [ProcessEntry(pid: 100, elapsed: "01:00", cpu: 5.0, memoryMB: 100, path: "/test")]
+        }
+    }
+
+    let counter = ProcessCounter()
+    let engineWithCounter = PollingEngine(
+        providers: [],
+        processSource: { counter.next() }
+    )
+
+    let baseTime = Date(timeIntervalSince1970: 1_700_000_000)
+
+    // 1. Poll pertama dari event file: memanggil processSource
+    _ = await engineWithCounter.poll(now: baseTime, fromFileEvent: true)
+    checkEqual(counter.count, 1, "Poll pertama dari event file memanggil processSource")
+
+    // 2. Poll kedua dari event file dalam waktu 5 detik (2 detik kemudian): processSource tidak dipanggil lagi
+    _ = await engineWithCounter.poll(now: baseTime.addingTimeInterval(2), fromFileEvent: true)
+    checkEqual(counter.count, 1, "Dua poll event file dalam 5 detik hanya memanggil processSource sekali")
+
+    // 3. Poll biasa (timer, fromFileEvent: false) 3 detik kemudian: selalu memanggil processSource
+    _ = await engineWithCounter.poll(now: baseTime.addingTimeInterval(3), fromFileEvent: false)
+    checkEqual(counter.count, 2, "Poll biasa (timer) selalu memanggil processSource")
+
+    // 4. Poll dari event file setelah snapshot berumur >= 5 detik (8.5 detik dari awal, yaitu 5.5 detik setelah poll #3): memanggil processSource lagi
+    _ = await engineWithCounter.poll(now: baseTime.addingTimeInterval(8.5), fromFileEvent: true)
+    checkEqual(counter.count, 3, "Poll event file setelah snapshot berumur >= 5 detik memanggil processSource lagi")
+}
+
+private final class EventWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var triggered = false
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var timeoutWorkItem: DispatchWorkItem?
+
+    func trigger() {
+        lock.lock()
+        defer { lock.unlock() }
+        triggered = true
+        if let cont = continuation {
+            continuation = nil
+            timeoutWorkItem?.cancel()
+            timeoutWorkItem = nil
+            cont.resume(returning: true)
+        }
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        triggered = false
+    }
+
+    func waitForEvent(timeoutSeconds: TimeInterval) async -> Bool {
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if triggered {
+                triggered = false
+                lock.unlock()
+                cont.resume(returning: true)
+                return
+            }
+
+            self.continuation = cont
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                if let waiting = self.continuation {
+                    self.continuation = nil
+                    self.timeoutWorkItem = nil
+                    waiting.resume(returning: false)
+                }
+            }
+            self.timeoutWorkItem = workItem
+            lock.unlock()
+
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: workItem)
+        }
+    }
+}
+
+@MainActor
+func testFileWatcher() async {
+    let tempWatched = FileManager.default.temporaryDirectory.appendingPathComponent("watch-test-\(UUID().uuidString)")
+    let tempOther = FileManager.default.temporaryDirectory.appendingPathComponent("other-test-\(UUID().uuidString)")
+
+    try? FileManager.default.createDirectory(at: tempWatched, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(at: tempOther, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: tempWatched)
+        try? FileManager.default.removeItem(at: tempOther)
+    }
+
+    let waiter = EventWaiter()
+    let watcher = FileWatcher(paths: [tempWatched.path], latency: 0.1) {
+        waiter.trigger()
+    }
+
+    // 1. Menulis file di folder yang dipantau memicu callback dalam waktu <= 3 detik
+    let testFile = tempWatched.appendingPathComponent("file1.txt")
+    try? "perubahan 1".data(using: .utf8)?.write(to: testFile)
+
+    let triggeredWatched = await waiter.waitForEvent(timeoutSeconds: 3.0)
+    check(triggeredWatched, "Menulis file di folder yang dipantau memicu callback dalam waktu <= 3 detik")
+
+    // 2. Menulis file di folder lain yang tidak dipantau tidak memicu callback dalam 2 detik
+    waiter.reset()
+    let otherFile = tempOther.appendingPathComponent("file2.txt")
+    try? "perubahan folder lain".data(using: .utf8)?.write(to: otherFile)
+
+    let triggeredOther = await waiter.waitForEvent(timeoutSeconds: 2.0)
+    check(!triggeredOther, "Menulis file di folder lain yang tidak dipantau tidak memicu callback dalam 2 detik")
+
+    // 3. Setelah watcher dihentikan, menulis file tidak lagi memicu callback
+    watcher.stop()
+    waiter.reset()
+
+    let stoppedFile = tempWatched.appendingPathComponent("file3.txt")
+    try? "perubahan setelah stop".data(using: .utf8)?.write(to: stoppedFile)
+
+    let triggeredAfterStop = await waiter.waitForEvent(timeoutSeconds: 2.0)
+    check(!triggeredAfterStop, "Setelah watcher dihentikan, menulis file tidak lagi memicu callback")
+}
+
 // MARK: - Main Execution
 
 print("========================================")
@@ -411,6 +762,11 @@ runSuite("ClaudeTranscript Parser", testClaudeTranscript)
 runSuite("CodexTranscript Parser", testCodexTranscript)
 runSuite("StreamReader Parser", testStreamReader)
 runSuite("AegisLoop & REVIEW.md Parser", testAegisLoopAndReview)
+runSuite("TranscriptActivityLog", testTranscriptActivityLog)
+runSuite("PresenceProvider", testPresenceProvider)
+runSuite("Ollama Parsing", testOllamaParsing)
+await runSuiteAsync("PollingEngine", testPollingEngine)
+await runSuiteAsync("FileWatcher", testFileWatcher)
 
 let duration = String(format: "%.3f", Date().timeIntervalSince(startTime))
 
