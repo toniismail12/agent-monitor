@@ -1,0 +1,4 @@
+{"event":"init","conversation_id":"conv-synthetic-denied-111","init":{"model":"gemini-2.5-pro"}}
+{"event":"step_update","step_update":{"step_index":1,"step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"rm -rf /tmp/data"}},"state":"ERROR"}}
+jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.
+{"event":"result","result":{"status":"SUCCESS"}}

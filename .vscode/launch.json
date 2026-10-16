@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:agent-monitor}",
+            "name": "Debug AgentMonitor",
+            "target": "AgentMonitor",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug AgentMonitor"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:agent-monitor}",
+            "name": "Release AgentMonitor",
+            "target": "AgentMonitor",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release AgentMonitor"
+        }
+    ]
+}

@@ -1,0 +1,3 @@
+{"type":"ai-title","aiTitle":"Migrasi Database"}
+{"type":"user","message":{"content":"Jalankan migrasi"},"timestamp":"2026-10-16T11:00:00.000Z","cwd":"/Users/dev/contoh-proyek"}
+{"type":"assistant","message":{"model":"claude-3-5-sonnet-20241022","content":[{"type":"tool_use","id":"call_bash_1","name":"Bash","input":{"command":"swift run db migrate"}}],"stop_reason":"tool_use"},"timestamp":"2026-10-16T11:00:05.000Z","cwd":"/Users/dev/contoh-proyek"}

@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"conv-synthetic-999","init":{"model":"gemini-2.5-pro"}}
+{"event":"step_update","step_update":{"step_index":1,"step_type":"tool","tool_name":"view_file","tool_info":{"parameters":{"AbsolutePath":"/Users/dev/contoh-proyek/Sources/Main.swift"}},"state":"ACTIVE"}}
+{"event":"step_update","step_update":{"step_index":1,"step_type":"tool","tool_name":"view_file","tool_info":{"parameters":{"AbsolutePath":"/Users/dev/contoh-proyek/Sources/Main.swift"}},"duration_seconds":0.8,"state":"DONE","usage":{"total_tokens":350}}}
+{"event":"step_update","step_update":{"step_index":2,"step_type":"agent_response","text_delta":"Kode telah diperiksa dan siap diuji.","state":"DONE"}}
+{"event":"result","result":{"status":"SUCCESS"}}

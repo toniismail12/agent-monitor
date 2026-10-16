@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"cwd":"/Users/dev/contoh-proyek"},"timestamp":"2026-10-16T12:30:00Z"}
+{"type":"turn_context","payload":{"model":"o3-mini"},"timestamp":"2026-10-16T12:30:00Z"}
+{"type":"event_msg","payload":{"type":"task_started","message":"Analisis performa"},"timestamp":"2026-10-16T12:30:01Z"}
+{"type":"response_item","payload":{"type":"function_call","name":"analyze_deps","call_id":"call_active_1","arguments":"{\"target\":\"App\"}"},"timestamp":"2026-10-16T12:30:03Z"}
