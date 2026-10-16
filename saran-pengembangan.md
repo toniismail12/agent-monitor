@@ -26,11 +26,11 @@ flowchart LR
 | # | Temuan | Lokasi | Dampak | Status |
 |---|---|---|---|---|
 | 1 | **Semua polling jalan di main thread.** Tiap 2 detik: spawn `ps`, `curl` ke Ollama (timeout 1 dtk!), `git status` + `git diff` (tiap 6 dtk), `lsof`, parse JSONL hingga 1 MB/file. | [refresh()](Sources/AgentMonitor/MonitorModel.swift#L127-L146), [ollamaModels()](Sources/AgentMonitor/Providers/PresenceProvider.swift) | UI bisa tersendat, terutama repo besar / Ollama lambat | ✅ Selesai (Tahap 1b) |
-| 2 | **"Menunggu izin" hanya ditebak** (tool terbuka > 20 dtk), state tetap `.working` → **tidak ada notifikasi** saat Claude sebenarnya butuh persetujuan Anda. | [ClaudeTranscript.session](Sources/AgentMonitor/Providers/ClaudeCodeProvider.swift#L104-L113) | Kasus terpenting justru terlewat | |
+| 2 | **"Menunggu izin" hanya ditebak** (tool terbuka > 20 dtk), state tetap `.working` → **tidak ada notifikasi** saat Claude sebenarnya butuh persetujuan Anda. | [ClaudeTranscript.session](Sources/AgentMonitor/Providers/ClaudeCodeProvider.swift#L104-L113) | Kasus terpenting justru terlewat | ✅ Selesai (Tahap 2a, hook Claude Code) |
 | 3 | Logika `append` / `mark` / `closeTool` diduplikasi persis di Claude & Codex transcript. | ClaudeCodeProvider / CodexProvider | Sulit dirawat saat menambah agen baru | ✅ Selesai (Tahap 1a) |
 | 4 | Belum ada test target; parser JSONL adalah kandidat ideal untuk test berbasis fixture. | [Package.swift](Package.swift) | Format log agen sering berubah → regresi diam-diam | ✅ Selesai (Tahap 0) |
 | 5 | Proyek **belum di-`git init`** dan tanpa README. | root | Tidak ada riwayat perubahan | ✅ Selesai (Tahap 0) |
-| 6 | Notifikasi tanpa aksi & tanpa `threadIdentifier`; klik notifikasi tidak membawa ke sesi. | [Notifier](Sources/AgentMonitor/Notifier.swift) | Kurang actionable | |
+| 6 | Notifikasi tanpa aksi & tanpa `threadIdentifier`; klik notifikasi tidak membawa ke sesi. | [Notifier](Sources/AgentMonitor/Notifier.swift) | Kurang actionable | ✅ Selesai (Tahap 2c) |
 | 7 | `model.models` dihitung ulang tiap render (cek `fileExists` + stat). | [MonitorModel.swift:44](Sources/AgentMonitor/MonitorModel.swift#L44) | Minor | |
 
 **Rekomendasi arsitektur:**
@@ -110,7 +110,7 @@ Kolom Status diperbarui Claude setiap kali sebuah tahap disetujui.
 |---|---|---|---|
 | 0 | `git init`, README, test target + fixture JSONL | Fondasi aman sebelum refactor | ✅ Selesai, commit `a36f96f` (16 Okt 2026) |
 | 1 | Polling ke background actor + FSEvents, protocol provider | Menghilangkan risiko UI freeze, memudahkan fitur berikutnya | ✅ Selesai: 1a protocol provider + log aktivitas bersama, 1b polling di background actor + Ollama via `URLSession`, 1c FSEvents (timer 5 dtk) |
-| 2 | **A (hooks)** + **B (lompat ke sesi)** + aksi notifikasi | Nilai harian paling terasa | |
+| 2 | **A (hooks)** + **B (lompat ke sesi)** + aksi notifikasi | Nilai harian paling terasa | ✅ Selesai: 2a hook Claude Code + status "Butuh izin", 2b lompat ke sesi (Terminal/iTerm2/VS Code/Cursor), 2c aksi notifikasi (Buka/Tunda/Tutup) |
 | 3 | **D (burn rate)** + **F (riwayat)** | Butuh penyimpanan histori yang sama | |
 | 4 | **C (notif HP)**, **E (Antigravity)**, **K (kontrol Aegis)** | Fitur pembeda | |
 | 5 | Sisanya sesuai selera | | |

@@ -31,12 +31,13 @@ package enum AgentKind: String, Sendable {
 
 /// Raw values give the display order: what needs the user comes first.
 package enum AgentState: Int, Comparable, Sendable {
-    case waiting, working, failed, finished, idle, running
+    case needsPermission, waiting, working, failed, finished, idle, running
 
     package static func < (lhs: AgentState, rhs: AgentState) -> Bool { lhs.rawValue < rhs.rawValue }
 
     package var label: String {
         switch self {
+        case .needsPermission: return "Butuh izin"
         case .waiting: return "Menunggu Anda"
         case .working: return "Bekerja"
         case .failed: return "Error"
@@ -98,7 +99,12 @@ package struct AgentSession: Identifiable, Sendable {
     }
 
     /// Agents that are done or quiet can be closed from the panel; a working one stays in view.
-    package var canDismiss: Bool { state != .working }
+    package var canDismiss: Bool { state != .working && state != .needsPermission }
+
+    /// Claude Code and Codex CLI sessions can be jumped to in their host terminal/editor.
+    package var canJump: Bool {
+        (kind == .claudeCode || kind == .codex) && project != nil
+    }
 }
 
 package struct Activity: Identifiable, Sendable {
@@ -167,7 +173,7 @@ package struct Activity: Identifiable, Sendable {
     }
 
     /// Picks the most telling parameter of a tool call (command line, file path, query).
-    static func summary(of parameters: [String: Any]) -> String {
+    package static func summary(of parameters: [String: Any]) -> String {
         let preferred = ["CommandLine", "command", "AbsolutePath", "TargetFile", "file_path", "notebook_path",
                          "DirectoryPath", "SearchPath", "SearchDirectory", "path", "Query", "query",
                          "Pattern", "pattern", "Url", "URL", "url", "description", "skill", "prompt"]

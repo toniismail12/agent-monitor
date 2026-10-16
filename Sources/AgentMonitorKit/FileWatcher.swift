@@ -6,7 +6,8 @@ package final class FileWatcher: @unchecked Sendable {
     package static let defaultDirectories: [URL] = [
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects"),
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
-        AegisLoop.directory
+        AegisLoop.directory,
+        HookHandler.defaultDirectory
     ]
 
     private static let queueKey = DispatchSpecificKey<Void>()

@@ -9,9 +9,138 @@ Nomor temuan berlanjut antar-putaran, sehingga setiap ID hanya muncul sekali.
 
 ## Putaran terbaru
 
-Belum ada. Tahap 1 selesai dan menunggu commit.
+Belum ada. Tahap 2 selesai dan menunggu commit.
 
 ## Riwayat
+
+### Tahap 2c (putaran 1, disetujui)
+
+**Tahap 2c (putaran 1): Disetujui tanpa temuan terbuka. Tahap 2 selesai.** Direview 2026-10-16.
+
+- Notifikasi sekarang punya `threadIdentifier` per sesi, `userInfo.agentId`, dan kategori aksi yang dipilih lewat fungsi murni:
+  - butuh izin → Buka + Tunda;
+  - menunggu/error/selesai → Buka + Tunda + Tutup pantauan;
+  - tanpa Buka kalau sesi tidak bisa dilompati;
+  - loop dan "Gemini CLI berhenti" → tanpa aksi.
+- Klik isi notifikasi atau "Buka" memanggil `jump(to:)`, "Tunda 10 mnt" menahan notifikasi agen itu, dan "Tutup pantauan" memanggil `dismiss(_:)`. `completionHandler` selalu dipanggil.
+- Sesi agy kembali berakhir dengan error jaringan **setelah** pekerjaan dan HANDOFF selesai.
+- Uji ulang oleh Claude: `swift build` ✓, `swift build -c release` ✓, `swift run AgentMonitorChecks` ✓ (442/442, ±4 dtk). Build bersih tanpa warning, dan test lama tidak diubah. Uji mutasi: 4 mutasi baru tertangkap semua (snooze, kategori butuh izin, klik isi notifikasi, Buka untuk sesi yang tidak bisa dilompati); yang lolos tetap hanya M13. Build sudah dipasang lewat `build.sh`.
+- Catatan, bukan temuan:
+  - `Notifier.categoryIdentifier` juga mencocokkan teks judul "Gemini CLI berhenti". Ini tidak perlu karena `state == nil` sudah menangani kasus itu.
+  - `cleanExpiredSnooze` meng-assign `snoozedUntil` (`@Published`) di setiap refresh. Saat ini tidak berdampak karena `agents` memang sudah di-publish di setiap poll.
+
+### Tahap 2b (putaran 1–2, disetujui)
+
+**Tahap 2b (putaran 1–2): Disetujui tanpa temuan terbuka.** Direview 2026-10-16.
+
+- Putaran 1 berhenti di langkah ke-10 karena Gemini menjalankan `ps`, yang tidak diizinkan. Putaran 2 diberi contoh output `ps` dan berhasil, tetapi sesi agy berakhir dengan error jaringan ("connection reset by peer") **setelah** pekerjaan dan HANDOFF selesai.
+- Uji ulang oleh Claude: `swift build` ✓, `swift build -c release` ✓, `swift run AgentMonitorChecks` ✓ (393/393, ±5 dtk). Build bersih tanpa warning. Uji mutasi: 5 mutasi baru tertangkap semua (`.app` terluar, kandidat ber-TTY, cwd di subfolder, escape AppleScript, `comm` berspasi); yang lolos tetap hanya M13.
+- Uji terhadap proses asli (aksi hanya dicetak, tidak dieksekusi): sesi Claude Code di VS Code menghasilkan `open -b com.microsoft.VSCode <project>`, dan Codex yang tidak berjalan menghasilkan "Sesi tidak ditemukan". Build sudah dipasang lewat `build.sh`, dan `NSAppleEventsUsageDescription` ada di bundle.
+- `osascript`/`open` dijalankan di `Task.detached`, jadi main thread tidak terblokir.
+- Catatan, bukan temuan:
+  - Jalur Terminal dan iTerm2 baru diuji dengan data sintetis, karena di Mac ini tidak ada iTerm dan tidak ada agen yang berjalan di Terminal.
+  - `AgentRow` sekarang `@ObservedObject` atas seluruh `MonitorModel` hanya untuk `jumpErrors`. Meneruskan `jumpError: String?` sebagai parameter akan lebih ringan.
+
+### Tahap 2a (putaran 1–2, disetujui)
+
+**Putusan Claude untuk Tahap 2a (putaran 2, perbaikan): Disetujui.** Direview 2026-10-16.
+
+- Temuan #17–#24 sudah diperbaiki: `received_at` sekarang memuat milidetik, `settings.json` ditulis tanpa `\/` dan hanya kalau berubah, symlink di-resolve, footer kembali hanya di menu bar, uninstall tidak menyentuh container kosong milik user, path dikutip dengan tanda kutip tunggal, dan append memakai `O_APPEND`. README juga sudah menjelaskan batasannya.
+- Uji wajib lolos (346/346, ±4 dtk), build bersih tanpa warning. Uji mutasi: semua mutasi baru tertangkap (#17 presisi waktu, `\/`, tulis tanpa perubahan, escape kutip, syarat tool terbuka); yang lolos tetap hanya M13.
+- Uji asap pada aplikasi terpasang: payload `PermissionRequest` sintetis → exit 0, stdout kosong, 74 ms, baris tertulis dengan milidetik dan tanpa `tool_input`; input bukan JSON → exit 0 tanpa tulisan. Baris uji sudah dihapus lagi.
+- `~/.claude/settings.json` milik user **tidak** disentuh. Hook baru aktif setelah user menyalakan toggle "Hook Claude Code".
+
+**Tahap 2a, putaran 1**: hook Claude Code (`--agent-monitor-hook`, `HookInstaller`), status "Butuh izin", dan keputusan notifikasi sebagai fungsi murni. Direview 2026-10-16.
+
+Uji ulang oleh Claude: `swift build` ✓, `swift build -c release` ✓, `swift run AgentMonitorChecks` ✓ (329/329, ±5 dtk). Build bersih tidak menghasilkan warning.
+
+Yang sudah benar:
+- Putaran berjalan bersih: tidak ada perintah di background, tidak ada akses ke luar project, dan binary aplikasi tidak dijalankan.
+- `HookHandler` tidak menyimpan `tool_input` utuh, tidak menulis ke stdout, dan selalu exit 0.
+- `HookInstaller` menolak `settings.json` yang tidak bisa di-parse, membuat backup, idempoten, dan mengganti entri lama milik kita.
+- `pendingNotifications` dipisah sebagai fungsi murni, dan transisi `needsPermission` → `waiting` ikut memberi notifikasi.
+- Test lama tidak ada yang diubah.
+- Uji mutasi: 4 dari 5 mutasi baru tertangkap (event lama, `idle_prompt`, uninstall, rotasi). Yang lolos dibahas di #23.
+
+#### 17. Waktu event hook hanya presisi detik, sehingga `PermissionRequest` sering tidak terdeteksi
+
+- **Tingkat:** Kritis
+- **Lokasi:** `Sources/AgentMonitorKit/HookHandler.swift:31` (`ISODate.string`), dibandingkan di `ClaudeTranscript.session` (`perm.receivedAt > lastAt`)
+- **Masalah:** `ISODate.string` tidak menyertakan pecahan detik; Claude sudah membuktikan bahwa `05.950` tersimpan sebagai `05`. Timestamp transcript Claude Code presisi milidetik, sementara `PermissionRequest` terjadi sesaat setelah entri `tool_use` ditulis, biasanya dalam detik yang sama. Contoh: `tool_use` pukul 10:00:05.800 dan event pukul 10:00:05.950 tersimpan sebagai 10:00:05.000. Event jadi tampak lebih lama dari entri terakhir, dan status "Butuh izin" tidak muncul. Akibatnya sinyal utama gagal: status baru muncul lewat `Notification` ±6 detik kemudian, atau tidak sama sekali kalau user menyetujui dalam 6 detik.
+- **Yang diminta:** Tulis `received_at` dengan pecahan detik (ISO8601 dengan `.withFractionalSeconds`, zona waktu lokal). `ISODate.parse` sudah bisa membacanya. Tambahkan test: `tool_use` di `…05.800Z` dan event di `…05.950` (ditulis lewat `processInput`, lalu dibaca provider) harus menghasilkan `.needsPermission`.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Menambahkan `ISODate.stringFractional` (`.withFractionalSeconds`, zona waktu lokal) di `Support.swift` dan menggunakannya untuk `received_at` di `HookHandler.swift`. Menambahkan unit test uji subdetik di mana `tool_use` ber-timestamp `10:00:05.800Z` dan event hook ber-timestamp `10:00:05.950Z` (ditulis via `processInput`), yang saat di-poll oleh `ClaudeCodeProvider` menghasilkan status `.needsPermission`.
+
+#### 18. `settings.json` user ditulis ulang dengan `\/` dan tetap ditulis meski tidak ada perubahan
+
+- **Tingkat:** Penting
+- **Lokasi:** `Sources/AgentMonitorKit/HookInstaller.swift`, `writeSettings` dan `uninstall(settingsURL:)`
+- **Masalah:**
+  - Tanpa `.withoutEscapingSlashes`, `JSONSerialization` mengubah setiap `/` menjadi `\/`. Claude sudah membuktikannya. Akibatnya semua path dan URL di settings user (command hook lain, MCP, dan lainnya) berubah tampilan.
+  - `uninstall` tetap menulis ulang file dan menimpa backup meskipun hook kita tidak terpasang.
+- **Yang diminta:**
+  - Tambahkan `.withoutEscapingSlashes`.
+  - Lewati penulisan dan backup kalau hasilnya sama dengan isi semula (bandingkan sebagai `NSDictionary`).
+  - Kalau `settings.json` adalah symlink, tulis ke target yang sudah di-resolve, jangan menimpa symlink-nya.
+  - Tambahkan test untuk ketiganya.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Menambahkan opsi `.withoutEscapingSlashes` pada serialisasi `JSONSerialization` di `HookInstaller.swift`. Menambahkan pengecekan kesamaan isi via `NSDictionary.isEqual` pada `uninstall` sehingga tidak menulis ulang file maupun menimpa backup jika tidak ada perubahan. Me-resolve path symlink via `resolvingSymlinksInPath()` sehingga operasi tulis dan backup dilakukan ke file target asli dan symlink tetap utuh. Menambahkan unit test untuk ketiga aspek tersebut.
+
+#### 19. Footer sekarang juga tampil di jendela panel (di luar tugas)
+
+- **Tingkat:** Penting
+- **Lokasi:** `Sources/AgentMonitorKit/Views.swift`, `MonitorView.body` dan `footer`
+- **Masalah:** Sebelumnya footer sengaja hanya ada di menu bar. Komentar di `MonitorView` menyebutkan: "In the on-screen window the list fills the window and the settings stay in the menu bar." Sekarang `Divider()` dan footer (Notifikasi, Jalan saat login, Hook, Keluar) juga tampil di jendela panel. Perubahan ini tidak diminta.
+- **Yang diminta:** Kembalikan seperti semula: `if !inPanel { Divider(); footer }`. Kontrol hook cukup ada di footer menu bar.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Mengembalikan pembungkus `if !inPanel { Divider(); footer }` di `Views.swift`, sehingga footer panel hanya tampil di menu bar dan tidak muncul pada jendela panel lepas.
+
+#### 20. `uninstall` ikut membersihkan container kosong milik user
+
+- **Tingkat:** Saran
+- **Lokasi:** `HookInstaller.uninstall(from:)`
+- **Masalah:** Grup matcher dengan `hooks: []` atau objek `"hooks": {}` yang memang sudah kosong sejak awal ikut dihapus, padahal bukan karena entri kita.
+- **Yang diminta:** Hapus grup atau event hanya kalau menjadi kosong **karena** entri kita dihapus, lalu tambahkan test-nya.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Memperbarui `HookInstaller.uninstall(from:)` agar grup matcher atau event hanya dihapus jika menjadi kosong secara spesifik karena hook milik Agent Monitor dihapus. Container kosong milik user (seperti `PreToolUse: []` atau matcher dengan `hooks: []`) tetap dipertahankan. Dilengkapi unit test verifikasi.
+
+#### 21. Path executable di command hook dikutip dengan tanda kutip ganda
+
+- **Tingkat:** Saran
+- **Lokasi:** `HookInstaller.command(for:)`
+- **Masalah:** Di dalam tanda kutip ganda, `sh` masih mengartikan `$`, backtick, `\`, dan `"`. Path yang mengandung karakter itu akan rusak atau bahkan dieksekusi.
+- **Yang diminta:** Kutip dengan tanda kutip tunggal dan escape `'` sebagai `'\''`, lalu tambahkan test path yang mengandung `'` dan `$`.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Mengubah `HookInstaller.command(for:)` untuk menggunakan tanda kutip tunggal `'...'` dengan escaping karakter `'` sebagai `'\''`. Karakter `$`, backtick, dan tanda kutip ganda kini diperlakukan secara literal oleh sh. Menambahkan unit test untuk path yang mengandung spasi, tanda kutip tunggal, dan `$`.
+
+#### 22. Append ke `events.jsonl` bisa saling menimpa antarproses
+
+- **Tingkat:** Saran
+- **Lokasi:** `HookHandler.processInput`
+- **Masalah:** Hook dari beberapa sesi bisa berjalan bersamaan. `FileHandle(forWritingTo:)` + `seekToEnd()` + `write` tidak atomik antarproses, jadi dua proses bisa menulis di offset yang sama.
+- **Yang diminta:** Buka file dengan `O_WRONLY | O_APPEND | O_CREAT` (misalnya lewat `open(2)` dan `FileHandle(fileDescriptor:closeOnDealloc:)`), lalu tulis satu baris dalam satu `write`.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Mengubah penulisan `events.jsonl` di `HookHandler.processInput` menggunakan syscall `open(fileURL.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)` dan `FileHandle(fileDescriptor:closeOnDealloc:true)`, menjamin append satu baris secara atomik di level kernel antarproses.
+
+#### 23. Syarat "ada tool terbuka" belum dites, dan path `~/.agent-monitor` ditulis di tiga tempat
+
+- **Tingkat:** Saran
+- **Lokasi:** `Sources/AgentMonitorChecks/main.swift`; `HookHandler.defaultDirectory`, `MonitorModel.agentMonitorDirectory`, `FileWatcher.defaultDirectories`
+- **Masalah:** Mutasi yang menghapus syarat `hasOpenTools` lolos semua test. Selain itu, path folder yang sama didefinisikan tiga kali.
+- **Yang diminta:** Tambahkan test "event izin lebih baru tetapi tidak ada tool terbuka → bukan `.needsPermission`". Pakai `HookHandler.defaultDirectory` di ketiga tempat itu.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Menyatukan path folder `~/.agent-monitor` ke `HookHandler.defaultDirectory` sebagai single source of truth, dan mereferensikannya di `MonitorModel.agentMonitorDirectory` (`nonisolated`) serta `FileWatcher.defaultDirectories`. Menambahkan unit test yang memvalidasi bahwa event izin yang lebih baru tidak memicu `.needsPermission` jika tidak ada tool yang terbuka (sesi tetap `.waiting`).
+
+#### 24. README belum menjelaskan batasan dan kapan hook berlaku
+
+- **Tingkat:** Saran
+- **Lokasi:** `README.md`, bagian "Hook Claude Code"
+- **Masalah:** Claude Code tidak mengirim event saat izin **diberikan**. Akibatnya, setelah user menyetujui perintah yang berjalan lama, status tetap "Butuh izin" sampai `tool_result` masuk. README juga menyebut perubahan "instan" tanpa menjelaskan batasan ini.
+- **Yang diminta:** Tambahkan dua kalimat:
+  - status "Butuh izin" baru hilang saat tool selesai, jadi perintah panjang yang sudah disetujui tetap tampil "Butuh izin" sampai selesai;
+  - Claude Code membaca ulang `settings.json` secara otomatis, jadi hook berlaku tanpa restart.
+- **Status:** `Diperbaiki`
+- **Tanggapan:** Memperbarui bagian "Hook Claude Code" di `README.md` dengan menambahkan penjelasan mengenai status "Butuh izin" yang baru hilang setelah eksekusi tool selesai (sehingga perintah panjang yang disetujui tetap berstatus tersebut sampai selesai), serta catatan bahwa Claude Code otomatis memuat ulang `settings.json` tanpa perlu me-restart sesi.
 
 ### Tahap 1c (putaran 1–2, disetujui)
 

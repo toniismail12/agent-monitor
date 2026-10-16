@@ -7,6 +7,10 @@ struct AgentMonitorApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     init() {
+        if CommandLine.arguments.contains("--agent-monitor-hook") {
+            HookHandler.handleStandardInput()
+            exit(0)
+        }
         if CommandLine.arguments.contains("--dump") {
             MonitorModel.dump()
             exit(0)

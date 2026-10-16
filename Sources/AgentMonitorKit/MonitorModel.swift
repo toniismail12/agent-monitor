@@ -50,9 +50,44 @@ package final class MonitorModel: ObservableObject {
     /// Models per agent; read from files that are cached until they change, so it is cheap to ask often.
     var models: [AgentModels] { catalog.snapshot(sessions: all) }
 
-    var waitingCount: Int { agents.filter { $0.state == .waiting }.count }
+    var waitingCount: Int { agents.filter { $0.state == .waiting || $0.state == .needsPermission }.count }
     var workingCount: Int { agents.filter { $0.state == .working }.count }
     var dismissableCount: Int { agents.filter(\.canDismiss).count }
+
+    @Published package private(set) var hookStatus: HookInstaller.Status = .notInstalled
+    @Published package var hookErrorMessage: String? = nil
+    @Published package var jumpErrors: [String: String] = [:]
+    @Published package private(set) var snoozedUntil: [String: Date] = [:]
+
+    nonisolated package static let agentMonitorDirectory = HookHandler.defaultDirectory
+
+    package static func ensureAgentMonitorDirectoryExists() {
+        try? FileManager.default.createDirectory(at: agentMonitorDirectory, withIntermediateDirectories: true)
+    }
+
+    package func checkHookStatus() {
+        hookStatus = HookInstaller.status()
+    }
+
+    package func installHook() {
+        hookErrorMessage = nil
+        do {
+            try HookInstaller.install()
+            hookStatus = HookInstaller.status()
+        } catch {
+            hookErrorMessage = error.localizedDescription
+        }
+    }
+
+    package func uninstallHook() {
+        hookErrorMessage = nil
+        do {
+            try HookInstaller.uninstall()
+            hookStatus = HookInstaller.status()
+        } catch {
+            hookErrorMessage = error.localizedDescription
+        }
+    }
 
     /// The loop shows while it runs or needs the user, was handed off recently, or an agent is open in its project.
     /// A loop paused or finished long ago stays out of sight.
@@ -75,7 +110,14 @@ package final class MonitorModel: ObservableObject {
         notificationsOn = UserDefaults.standard.object(forKey: "notificationsOn") as? Bool ?? true
         let stored = UserDefaults.standard.dictionary(forKey: "dismissedAgents") as? [String: Double] ?? [:]
         dismissed = stored.mapValues(Date.init(timeIntervalSince1970:))
+        if live {
+            Self.ensureAgentMonitorDirectoryExists()
+            checkHookStatus()
+        }
         guard live else { return }
+        Notifier.onAction = { [weak self] action in
+            self?.handleNotificationAction(action)
+        }
         Notifier.requestPermission()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -442,6 +484,39 @@ package final class MonitorModel: ObservableObject {
                                 configuration: NSWorkspace.OpenConfiguration())
     }
 
+    /// Jumps directly to where the agent session is running (Terminal tab, iTerm2 session, or VS Code / Cursor window).
+    package func jump(to agentId: String) {
+        guard let agent = agents.first(where: { $0.id == agentId }) ?? all.first(where: { $0.id == agentId }),
+              let project = agent.project else {
+            jumpErrors[agentId] = "Sesi tidak ditemukan"
+            return
+        }
+        guard agent.kind == .claudeCode || agent.kind == .codex else {
+            return
+        }
+
+        jumpErrors[agentId] = nil
+        let kind = agent.kind
+
+        Task.detached {
+            let action = SessionJumper.resolveAction(forKind: kind, projectPath: project)
+            await MainActor.run {
+                if action == .notFound {
+                    self.jumpErrors[agentId] = "Sesi tidak ditemukan"
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        if self.jumpErrors[agentId] == "Sesi tidak ditemukan" {
+                            self.jumpErrors[agentId] = nil
+                        }
+                    }
+                }
+            }
+            if action != .notFound {
+                SessionJumper.execute(action)
+            }
+        }
+    }
+
     func setLaunchAtLogin(_ enabled: Bool) {
         do {
             if enabled {
@@ -457,36 +532,172 @@ package final class MonitorModel: ObservableObject {
 
     // MARK: - Notifications
 
+    package func snooze(_ agentId: String, duration: TimeInterval = 10 * 60) {
+        snoozedUntil[agentId] = Date().addingTimeInterval(duration)
+    }
+
+    package func cleanExpiredSnooze(now: Date = Date()) {
+        snoozedUntil = snoozedUntil.filter { $0.value > now }
+    }
+
+    package func handleNotificationAction(_ action: NotificationActionResponse) {
+        switch action {
+        case .jump(let agentId):
+            jump(to: agentId)
+        case .openPanel:
+            NSApp.activate(ignoringOtherApps: true)
+        case .snooze(let agentId):
+            snooze(agentId)
+        case .dismiss(let agentId):
+            dismiss(agentId)
+        case .none:
+            break
+        }
+    }
+
+    package struct NotificationItem: Equatable, Sendable {
+        package let title: String
+        package let message: String
+        package let agentId: String?
+        package let kind: AgentKind?
+        package let state: AgentState?
+        package let canJump: Bool
+
+        package var threadIdentifier: String {
+            agentId ?? "loop"
+        }
+
+        package init(
+            title: String,
+            message: String,
+            agentId: String? = nil,
+            kind: AgentKind? = nil,
+            state: AgentState? = nil,
+            canJump: Bool = false
+        ) {
+            self.title = title
+            self.message = message
+            self.agentId = agentId
+            self.kind = kind
+            self.state = state
+            self.canJump = canJump
+        }
+    }
+
+    /// Pure function determining which notifications should be dispatched given the state transition.
+    package nonisolated static func pendingNotifications(
+        currentSessions: [AgentSession],
+        previousSessions: [String: AgentSession],
+        currentLoop: LoopSnapshot?,
+        previousLoopStatus: String?,
+        primed: Bool,
+        notificationsOn: Bool,
+        snoozedUntil: [String: Date] = [:],
+        now: Date = Date()
+    ) -> [NotificationItem] {
+        guard primed, notificationsOn else { return [] }
+
+        var items: [NotificationItem] = []
+
+        for session in currentSessions {
+            guard let before = previousSessions[session.id], before.state != session.state else { continue }
+            if let until = snoozedUntil[session.id], until > now {
+                continue
+            }
+            switch session.state {
+            case .needsPermission:
+                items.append(NotificationItem(
+                    title: "\(session.kind.name) butuh izin",
+                    message: "\(session.title): \(session.detail)",
+                    agentId: session.id,
+                    kind: session.kind,
+                    state: session.state,
+                    canJump: session.canJump
+                ))
+            case .waiting where before.state == .working || before.state == .needsPermission:
+                items.append(NotificationItem(
+                    title: "\(session.kind.name) menunggu Anda",
+                    message: "\(session.title): \(session.detail)",
+                    agentId: session.id,
+                    kind: session.kind,
+                    state: session.state,
+                    canJump: session.canJump
+                ))
+            case .failed:
+                items.append(NotificationItem(
+                    title: "\(session.kind.name) error",
+                    message: "\(session.title): \(session.detail)",
+                    agentId: session.id,
+                    kind: session.kind,
+                    state: session.state,
+                    canJump: session.canJump
+                ))
+            case .finished where before.state == .working:
+                items.append(NotificationItem(
+                    title: "\(session.kind.name) selesai",
+                    message: session.title,
+                    agentId: session.id,
+                    kind: session.kind,
+                    state: session.state,
+                    canJump: session.canJump
+                ))
+            default:
+                break
+            }
+        }
+
+        let current = Set(currentSessions.map(\.id))
+        for (id, before) in previousSessions where !current.contains(id) && before.kind == .geminiCLI && before.state == .working {
+            if let until = snoozedUntil[id], until > now {
+                continue
+            }
+            items.append(NotificationItem(
+                title: "Gemini CLI berhenti",
+                message: before.title,
+                agentId: id,
+                kind: .geminiCLI,
+                state: nil,
+                canJump: false
+            ))
+        }
+
+        if let status = currentLoop?.state.status, status != previousLoopStatus, let currentLoop {
+            items.append(NotificationItem(
+                title: "Loop \(Format.folderName(currentLoop.state.project) ?? ""): \(currentLoop.status.title)",
+                message: currentLoop.subtitle,
+                agentId: nil,
+                kind: nil,
+                state: nil,
+                canJump: false
+            ))
+        }
+
+        return items
+    }
+
     private func notifyChanges(_ sessions: [AgentSession], loop snapshot: LoopSnapshot?) {
         defer {
             previous = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
             previousLoopStatus = snapshot?.state.status
             primed = true
         }
-        // The first pass only records what is already going on.
-        guard primed, notificationsOn else { return }
 
-        for session in sessions {
-            guard let before = previous[session.id], before.state != session.state else { continue }
-            switch session.state {
-            case .waiting where before.state == .working:
-                Notifier.post("\(session.kind.name) menunggu Anda", "\(session.title): \(session.detail)")
-            case .failed:
-                Notifier.post("\(session.kind.name) error", "\(session.title): \(session.detail)")
-            case .finished where before.state == .working:
-                Notifier.post("\(session.kind.name) selesai", session.title)
-            default:
-                break
-            }
-        }
+        let now = Date()
+        cleanExpiredSnooze(now: now)
 
-        let current = Set(sessions.map(\.id))
-        for (id, before) in previous where !current.contains(id) && before.kind == .geminiCLI && before.state == .working {
-            Notifier.post("Gemini CLI berhenti", before.title)
-        }
+        let items = Self.pendingNotifications(
+            currentSessions: sessions,
+            previousSessions: previous,
+            currentLoop: snapshot,
+            previousLoopStatus: previousLoopStatus,
+            primed: primed,
+            notificationsOn: notificationsOn,
+            snoozedUntil: snoozedUntil,
+            now: now
+        )
 
-        if let status = snapshot?.state.status, status != previousLoopStatus, let snapshot {
-            Notifier.post("Loop \(Format.folderName(snapshot.state.project) ?? ""): \(snapshot.status.title)", snapshot.subtitle)
+        for item in items {
+            Notifier.post(item)
         }
     }
 }

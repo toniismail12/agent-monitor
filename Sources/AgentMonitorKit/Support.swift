@@ -120,8 +120,18 @@ package enum ISODate {
         return formatter
     }()
 
+    private static let localFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = .current
+        return formatter
+    }()
+
     /// "2026-10-16T14:50:29+07:00", like the timestamps Claude writes.
     package static func string(_ date: Date) -> String { local.string(from: date) }
+
+    /// "2026-10-16T14:50:29.950+07:00", ISO8601 with fractional seconds and local timezone.
+    package static func stringFractional(_ date: Date) -> String { localFractional.string(from: date) }
 }
 
 enum FileScan {

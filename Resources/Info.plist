@@ -22,5 +22,7 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Agent Monitor memerlukan izin Automation untuk mengaktifkan tab atau jendela terminal tempat agen AI Anda berjalan.</string>
 </dict>
 </plist>

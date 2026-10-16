@@ -1,4 +1,5 @@
 import Foundation
+import UserNotifications
 import AgentMonitorKit
 
 setvbuf(stdout, nil, _IOLBF, 0)
@@ -748,6 +749,960 @@ func testFileWatcher() async {
     check(!triggeredAfterStop, "Setelah watcher dihentikan, menulis file tidak lagi memicu callback")
 }
 
+// MARK: - Tahap 2a Test Suites
+
+func testHookHandler() {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("agent_monitor_hook_handler_\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let receivedTime = ISODate.parse("2026-10-16T12:00:00.000Z")!
+
+    // 1. Payload PermissionRequest -> satu baris JSON dengan field yang benar, termasuk tool_summary dan tanpa tool_input
+    let permPayload = """
+    {
+      "hook_event_name": "PermissionRequest",
+      "session_id": "session-abc-1",
+      "cwd": "/Users/dev/contoh-proyek",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "npm test",
+        "description": "Run tests"
+      }
+    }
+    """.data(using: .utf8)!
+
+    let processed1 = HookHandler.processInput(permPayload, receivedAt: receivedTime, directory: tempDir)
+    check(processed1, "processInput sukses memproses payload PermissionRequest")
+
+    let eventsFile = tempDir.appendingPathComponent("events.jsonl")
+    let lines1 = (try? String(contentsOf: eventsFile, encoding: .utf8))?
+        .split(separator: "\n", omittingEmptySubsequences: true) ?? []
+    checkEqual(lines1.count, 1, "Tepat satu baris ditulis ke events.jsonl")
+
+    if let firstLine = lines1.first,
+       let json1 = try? JSONSerialization.jsonObject(with: Data(firstLine.utf8)) as? [String: Any] {
+        checkEqual(json1["event"] as? String, "PermissionRequest", "Event PermissionRequest tercatat")
+        checkEqual(json1["session_id"] as? String, "session-abc-1", "session_id PermissionRequest tercatat")
+        checkEqual(json1["cwd"] as? String, "/Users/dev/contoh-proyek", "cwd PermissionRequest tercatat")
+        checkEqual(json1["tool_name"] as? String, "Bash", "tool_name tercatat")
+        checkEqual(json1["tool_summary"] as? String, "npm test", "tool_summary diparsing dari tool_input")
+        check(json1["tool_input"] == nil, "tool_input utuh tidak disimpan")
+        checkEqual(json1["received_at"] as? String, ISODate.stringFractional(receivedTime), "received_at terformat ISODate.stringFractional dengan pecahan detik")
+    }
+
+    // Pemangkasan tool_summary hingga 160 karakter
+    let longCommand = String(repeating: "echo 'panjang sekali'; ", count: 20)
+    let longPayload = """
+    {
+      "hook_event_name": "PermissionRequest",
+      "session_id": "session-long",
+      "cwd": "/Users/dev/contoh-proyek",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "\(longCommand)"
+      }
+    }
+    """.data(using: .utf8)!
+    HookHandler.processInput(longPayload, receivedAt: receivedTime, directory: tempDir)
+    let linesLong = (try? String(contentsOf: eventsFile, encoding: .utf8))?
+        .split(separator: "\n", omittingEmptySubsequences: true) ?? []
+    if let lastLine = linesLong.last,
+       let jsonLong = try? JSONSerialization.jsonObject(with: Data(lastLine.utf8)) as? [String: Any] {
+        let summary = jsonLong["tool_summary"] as? String ?? ""
+        check(summary.count <= 160, "tool_summary dipangkas maksimal 160 karakter (aktual: \(summary.count))")
+    }
+
+    // 2. Payload Notification permission_prompt
+    let notifPayload = """
+    {
+      "hook_event_name": "Notification",
+      "session_id": "session-abc-2",
+      "cwd": "/Users/dev/contoh-proyek",
+      "notification_type": "permission_prompt",
+      "message": "Claude butuh izin Anda"
+    }
+    """.data(using: .utf8)!
+
+    let processed2 = HookHandler.processInput(notifPayload, receivedAt: receivedTime, directory: tempDir)
+    check(processed2, "processInput sukses memproses payload Notification")
+
+    let lines2 = (try? String(contentsOf: eventsFile, encoding: .utf8))?
+        .split(separator: "\n", omittingEmptySubsequences: true) ?? []
+    if let lastLine = lines2.last,
+       let json2 = try? JSONSerialization.jsonObject(with: Data(lastLine.utf8)) as? [String: Any] {
+        checkEqual(json2["event"] as? String, "Notification", "Event Notification tercatat")
+        checkEqual(json2["notification_type"] as? String, "permission_prompt", "notification_type tercatat")
+        checkEqual(json2["message"] as? String, "Claude butuh izin Anda", "message tercatat")
+        check(json2["tool_name"] == nil, "tool_name tidak ada pada Notification")
+        check(json2["tool_summary"] == nil, "tool_summary tidak ada pada Notification")
+    }
+
+    // 3. Stdin bukan JSON -> tidak menulis apa pun
+    let tempDirInvalid = FileManager.default.temporaryDirectory
+        .appendingPathComponent("agent_monitor_hook_invalid_\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempDirInvalid) }
+
+    let invalidResult1 = HookHandler.processInput("bukan json".data(using: .utf8)!, directory: tempDirInvalid)
+    check(!invalidResult1, "processInput menolak string non-JSON")
+    check(!FileManager.default.fileExists(atPath: tempDirInvalid.appendingPathComponent("events.jsonl").path), "File events.jsonl tidak dibuat untuk data non-JSON")
+
+    let invalidResult2 = HookHandler.processInput(Data(), directory: tempDirInvalid)
+    check(!invalidResult2, "processInput menolak data kosong")
+
+    // 4. Rotasi saat file lebih dari 1 MB
+    let tempDirRotate = FileManager.default.temporaryDirectory
+        .appendingPathComponent("agent_monitor_hook_rotate_\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempDirRotate) }
+    try? FileManager.default.createDirectory(at: tempDirRotate, withIntermediateDirectories: true)
+
+    let rotateFile = tempDirRotate.appendingPathComponent("events.jsonl")
+    let oldRotatedFile = tempDirRotate.appendingPathComponent("events.jsonl.1")
+
+    // Tulis file lama yang melebihi 1 MB
+    let largeContent = Data(repeating: 0x42, count: 1_000_050)
+    try? largeContent.write(to: rotateFile)
+    try? "old backup to be overwritten".data(using: .utf8)?.write(to: oldRotatedFile)
+
+    let rotatedProcessed = HookHandler.processInput(permPayload, receivedAt: receivedTime, directory: tempDirRotate, maxFileSize: 1_000_000)
+    check(rotatedProcessed, "processInput berhasil memicu rotasi")
+
+    check(FileManager.default.fileExists(atPath: oldRotatedFile.path), "events.jsonl.1 berhasil dibuat saat rotasi")
+    let rotatedSize = (try? FileManager.default.attributesOfItem(atPath: oldRotatedFile.path))?[.size] as? Int64 ?? 0
+    checkEqual(rotatedSize, 1_000_050, "events.jsonl.1 berisi data lama 1 MB dan menimpa backup sebelumnya")
+
+    let newFileSize = (try? FileManager.default.attributesOfItem(atPath: rotateFile.path))?[.size] as? Int64 ?? 0
+    check(newFileSize > 0 && newFileSize < 1000, "events.jsonl baru hanya berisi baris baru setelah rotasi")
+}
+
+func testHookInstaller() {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("agent_monitor_hook_installer_\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+    let settingsURL = tempDir.appendingPathComponent("settings.json")
+    let backupURL = URL(fileURLWithPath: settingsURL.path + ".agent-monitor.bak")
+    let appPath = "/Applications/Agent Monitor.app/Contents/MacOS/Agent Monitor"
+
+    // 1. Path dikutip benar dengan tanda kutip tunggal dan escaping (termasuk spasi, ', $)
+    let cmd = HookInstaller.command(for: appPath)
+    checkEqual(cmd, "[ -x '\(appPath)' ] && '\(appPath)' --agent-monitor-hook || true", "Command dikutip benar dengan tanda kutip tunggal")
+
+    let trickyPath = "/Applications/Toni's $Special App.app/Contents/MacOS/Agent Monitor"
+    let trickyCmd = HookInstaller.command(for: trickyPath)
+    let expectedEscaped = "/Applications/Toni'\\''s $Special App.app/Contents/MacOS/Agent Monitor"
+    checkEqual(trickyCmd, "[ -x '\(expectedEscaped)' ] && '\(expectedEscaped)' --agent-monitor-hook || true", "Command meng-escape tanda kutip tunggal dan mempertahankan $ secara literal")
+
+    // 2. Settings kosong (file belum ada)
+    checkEqual(HookInstaller.status(settingsURL: settingsURL), .notInstalled, "Status awal belum terpasang")
+    try? HookInstaller.install(settingsURL: settingsURL, executablePath: appPath)
+    checkEqual(HookInstaller.status(settingsURL: settingsURL), .installed, "Status setelah install menjadi terpasang")
+    check(!FileManager.default.fileExists(atPath: backupURL.path), "Backup tidak dibuat jika file sebelumnya belum ada")
+
+    // 3. Backup dibuat saat file sudah ada
+    try? HookInstaller.install(settingsURL: settingsURL, executablePath: appPath)
+    check(FileManager.default.fileExists(atPath: backupURL.path), "Backup settings.json.agent-monitor.bak dibuat saat menimpa file yang ada")
+
+    // 4. Install dua kali -> tidak duplikat (idempotensi)
+    if let data = try? Data(contentsOf: settingsURL),
+       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+       let hooks = json["hooks"] as? [String: Any] {
+        let permMatchers = hooks["PermissionRequest"] as? [[String: Any]] ?? []
+        checkEqual(permMatchers.count, 1, "PermissionRequest hanya memiliki 1 grup matcher")
+        let permHooks = permMatchers.first?["hooks"] as? [[String: Any]] ?? []
+        checkEqual(permHooks.count, 1, "PermissionRequest tidak menduplikasi hook entry")
+
+        let notifMatchers = hooks["Notification"] as? [[String: Any]] ?? []
+        checkEqual(notifMatchers.count, 1, "Notification hanya memiliki 1 grup matcher")
+        let notifHooks = notifMatchers.first?["hooks"] as? [[String: Any]] ?? []
+        checkEqual(notifHooks.count, 1, "Notification tidak menduplikasi hook entry")
+    }
+
+    // 5. Entri lama dengan path berbeda -> diganti
+    let newAppPath = "/Volumes/Custom/Agent Monitor.app/Contents/MacOS/Agent Monitor"
+    try? HookInstaller.install(settingsURL: settingsURL, executablePath: newAppPath)
+    if let data = try? Data(contentsOf: settingsURL),
+       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+       let hooks = json["hooks"] as? [String: Any],
+       let permMatchers = hooks["PermissionRequest"] as? [[String: Any]],
+       let firstPerm = (permMatchers.first?["hooks"] as? [[String: Any]])?.first?["command"] as? String {
+        check(firstPerm.contains(newAppPath), "Path hook lama diperbarui ke path baru")
+        check(!firstPerm.contains(appPath), "Path lama tidak tersisa")
+    }
+
+    // 6. Settings yang sudah punya hook dan key lain milik user -> tetap utuh
+    let userSettings: [String: Any] = [
+        "theme": "dark",
+        "customKey": 42,
+        "hooks": [
+            "PreToolUse": [
+                [
+                    "matcher": "Bash",
+                    "hooks": [["type": "command", "command": "custom_pre_tool.sh"]]
+                ]
+            ],
+            "PermissionRequest": [
+                [
+                    "matcher": "",
+                    "hooks": [["type": "command", "command": "user_watcher.sh"]]
+                ]
+            ]
+        ]
+    ]
+
+    let merged = HookInstaller.install(in: userSettings, executablePath: appPath)
+    checkEqual(merged["theme"] as? String, "dark", "Key root theme milik user tetap utuh")
+    checkEqual(merged["customKey"] as? Int, 42, "Key root customKey milik user tetap utuh")
+    let mergedHooks = merged["hooks"] as? [String: Any] ?? [:]
+    check(mergedHooks["PreToolUse"] != nil, "Event hook PreToolUse milik user tetap utuh")
+
+    let mergedPerm = mergedHooks["PermissionRequest"] as? [[String: Any]] ?? []
+    let mergedPermHooks = mergedPerm.first?["hooks"] as? [[String: Any]] ?? []
+    checkEqual(mergedPermHooks.count, 2, "Matcher '' menggabungkan hook user dan hook kita")
+    check(mergedPermHooks.contains { ($0["command"] as? String) == "user_watcher.sh" }, "Hook user_watcher.sh tetap ada")
+
+    // 7. Uninstall hanya menghapus milik kita dan membersihkan container kosong
+    let uninstalled = HookInstaller.uninstall(from: merged)
+    checkEqual(uninstalled["theme"] as? String, "dark", "Root theme tetap utuh setelah uninstall")
+    let uninstalledHooks = uninstalled["hooks"] as? [String: Any] ?? [:]
+    check(uninstalledHooks["PreToolUse"] != nil, "PreToolUse user tetap ada setelah uninstall")
+    let uninstalledPerm = uninstalledHooks["PermissionRequest"] as? [[String: Any]] ?? []
+    let uninstalledPermHooks = uninstalledPerm.first?["hooks"] as? [[String: Any]] ?? []
+    checkEqual(uninstalledPermHooks.count, 1, "Hook kita dihapus dari matcher")
+    checkEqual(uninstalledPermHooks.first?["command"] as? String, "user_watcher.sh", "Hanya hook user yang tersisa")
+    check(uninstalledHooks["Notification"] == nil, "Notification yang kosong dibersihkan dari hooks")
+
+    // Uninstall saat hanya ada hook kita -> key 'hooks' terhapus sepenuhnya
+    let onlyOurHooksSettings = HookInstaller.install(in: [:], executablePath: appPath)
+    let cleaned = HookInstaller.uninstall(from: onlyOurHooksSettings)
+    check(cleaned["hooks"] == nil, "Key hooks yang menjadi kosong dihapus sepenuhnya")
+
+    // 8. File yang tidak bisa di-parse -> error, file tidak berubah
+    let corruptURL = tempDir.appendingPathComponent("corrupt_settings.json")
+    let corruptContent = "{ json rusak tanpa penutup"
+    try? corruptContent.write(to: corruptURL, atomically: true, encoding: .utf8)
+    var threwExpectedError = false
+    do {
+        try HookInstaller.install(settingsURL: corruptURL, executablePath: appPath)
+    } catch let error as HookInstaller.InstallError {
+        threwExpectedError = (error == .unparseableSettings)
+    } catch {}
+    check(threwExpectedError, "File rusak menghasilkan error unparseableSettings")
+    let afterCorruptContent = (try? String(contentsOf: corruptURL, encoding: .utf8)) ?? ""
+    checkEqual(afterCorruptContent, corruptContent, "Isi file rusak tidak berubah sama sekali")
+
+    // 9. disableAllHooks: true
+    let disabledSettings: [String: Any] = [
+        "disableAllHooks": true,
+        "hooks": onlyOurHooksSettings["hooks"] as Any
+    ]
+    checkEqual(HookInstaller.status(in: disabledSettings), .disabled, "status menghasilkan .disabled saat disableAllHooks == true")
+
+    // 10. Penolakan jika aplikasi tidak berjalan dari bundle .app
+    var threwBundleError = false
+    do {
+        // Bundle.main di lingkungan CLI test bukan .app
+        try HookInstaller.install(settingsURL: settingsURL, executablePath: nil, bundle: Bundle.main)
+    } catch let error as HookInstaller.InstallError {
+        threwBundleError = (error == .notInAppBundle)
+    } catch {}
+    check(threwBundleError, "Install menolak eksekusi di luar bundle .app")
+
+    // 11. Container kosong yang bukan karena hook kita tidak ikut dihapus (#20)
+    let preExistingEmpty: [String: Any] = [
+        "hooks": [
+            "PreToolUse": [] as [Any],
+            "PostToolUse": [
+                [
+                    "matcher": "Bash",
+                    "hooks": [] as [Any]
+                ]
+            ],
+            "Notification": [
+                [
+                    "matcher": "idle",
+                    "hooks": [] as [Any]
+                ],
+                [
+                    "matcher": "permission_prompt",
+                    "hooks": [["type": "command", "command": HookInstaller.command(for: appPath)]]
+                ]
+            ]
+        ]
+    ]
+    let uninstalledPreserved = HookInstaller.uninstall(from: preExistingEmpty)
+    let preservedHooks = uninstalledPreserved["hooks"] as? [String: Any] ?? [:]
+    check(preservedHooks["PreToolUse"] != nil, "Event PreToolUse yang memang kosong sejak awal tidak dihapus")
+    check(preservedHooks["PostToolUse"] != nil, "Event PostToolUse dengan matcher ber-hooks kosong tetap ada")
+    let preservedNotifs = preservedHooks["Notification"] as? [[String: Any]] ?? []
+    checkEqual(preservedNotifs.count, 1, "Hanya matcher yang berisi hook kita yang dihapus saat kosong")
+    checkEqual(preservedNotifs.first?["matcher"] as? String, "idle", "Matcher idle milik user tetap utuh")
+
+    // 12. withoutEscapingSlashes (#18)
+    let slashTestURL = tempDir.appendingPathComponent("slash_test.json")
+    try? HookInstaller.install(settingsURL: slashTestURL, executablePath: appPath)
+    let slashContent = (try? String(contentsOf: slashTestURL, encoding: .utf8)) ?? ""
+    check(!slashContent.contains("\\/"), "settings.json yang ditulis tidak mengandung escaped slash (\\/)")
+    check(slashContent.contains("/Applications/Agent Monitor.app"), "Path di settings.json tetap menggunakan slash biasa")
+
+    // 13. Skip write & backup saat uninstall jika tidak ada perubahan (#18)
+    let noChangeURL = tempDir.appendingPathComponent("no_change_settings.json")
+    let noChangeBakURL = URL(fileURLWithPath: noChangeURL.path + ".agent-monitor.bak")
+    let originalNoChange = "{\n  \"theme\" : \"light\"\n}"
+    try? originalNoChange.write(to: noChangeURL, atomically: true, encoding: .utf8)
+    try? HookInstaller.uninstall(settingsURL: noChangeURL)
+    check(!FileManager.default.fileExists(atPath: noChangeBakURL.path), "uninstall saat hook tidak terpasang tidak membuat backup")
+    let afterNoChange = (try? String(contentsOf: noChangeURL, encoding: .utf8)) ?? ""
+    checkEqual(afterNoChange, originalNoChange, "uninstall saat hook tidak terpasang tidak mengubah isi file")
+
+    // 14. Symlink settings.json tidak ditimpa, melainkan menulis ke target (#18)
+    let realURL = tempDir.appendingPathComponent("real_settings.json")
+    let symlinkURL = tempDir.appendingPathComponent("symlink_settings.json")
+    try? "{\n  \"theme\" : \"solarized\"\n}".write(to: realURL, atomically: true, encoding: .utf8)
+    try? FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: realURL)
+
+    try? HookInstaller.install(settingsURL: symlinkURL, executablePath: appPath)
+    let isStillSymlink = (try? FileManager.default.destinationOfSymbolicLink(atPath: symlinkURL.path)) != nil
+    check(isStillSymlink, "settings.json berupa symlink tetap berupa symlink setelah install")
+    let realInstalledContent = (try? String(contentsOf: realURL, encoding: .utf8)) ?? ""
+    check(realInstalledContent.contains("--agent-monitor-hook"), "Hook terpasang di target symlink asli")
+    let realBakURL = URL(fileURLWithPath: realURL.path + ".agent-monitor.bak")
+    check(FileManager.default.fileExists(atPath: realBakURL.path), "Backup dibuat pada target symlink asli")
+}
+
+func testClaudeCodeHookStatusAndNeedsPermission() {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("agent_monitor_claude_status_\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+    let sessionPath = tempDir.appendingPathComponent("session-needs-perm.jsonl").path
+    let initialTranscript = ("""
+    {"type":"user","message":{"role":"user","content":"Run tests"},"timestamp":"2026-10-16T10:00:00.000Z"}
+    {"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_1","name":"Bash","input":{"command":"npm test"}}]},"timestamp":"2026-10-16T10:00:01.000Z"}
+    """ + "\n").data(using: .utf8)!
+    try? initialTranscript.write(to: URL(fileURLWithPath: sessionPath))
+
+    let transcript = ClaudeTranscript(path: sessionPath)
+    transcript.update()
+
+    let now = ISODate.parse("2026-10-16T10:00:10.000Z")!
+    let lastModified = ISODate.parse("2026-10-16T10:00:01.000Z")!
+
+    // 1. Transcript dengan tool terbuka + event izin yang lebih baru -> .needsPermission dengan detail yang benar
+    let permEventNewer = HookPermissionEvent(
+        sessionId: "session-needs-perm",
+        receivedAt: ISODate.parse("2026-10-16T10:00:03.000Z")!,
+        toolName: "Bash",
+        toolSummary: "npm test"
+    )
+    let sPerm = transcript.session(now: now, modified: lastModified, permissionEvent: permEventNewer)
+    checkEqual(sPerm?.state, .needsPermission, "Status menjadi .needsPermission ketika event izin lebih baru dari transcript")
+    checkEqual(sPerm?.detail, "Minta izin: Bash — npm test", "Detail sesi memformat 'Minta izin: toolName — toolSummary'")
+    checkEqual(sPerm?.canDismiss, false, "Sesi .needsPermission tidak dapat ditutup (canDismiss == false)")
+
+    // Notification permission_prompt tanpa tool_name
+    let notifEvent = HookPermissionEvent(
+        sessionId: "session-needs-perm",
+        receivedAt: ISODate.parse("2026-10-16T10:00:03.000Z")!,
+        toolName: nil,
+        message: "Claude butuh izin untuk melanjutkan"
+    )
+    let sNotif = transcript.session(now: now, modified: lastModified, permissionEvent: notifEvent)
+    checkEqual(sNotif?.state, .needsPermission, "Notification permission_prompt menghasilkan state .needsPermission")
+    checkEqual(sNotif?.detail, "Claude butuh izin untuk melanjutkan", "Detail sesi mengambil message dari Notification ketika toolName nil")
+
+    // 2. Event izin lebih lama dari entri terakhir -> bukan .needsPermission
+    let permEventOlder = HookPermissionEvent(
+        sessionId: "session-needs-perm",
+        receivedAt: ISODate.parse("2026-10-16T10:00:00.500Z")!,
+        toolName: "Bash",
+        toolSummary: "npm test"
+    )
+    let sOlder = transcript.session(now: now, modified: lastModified, permissionEvent: permEventOlder)
+    checkEqual(sOlder?.state, .working, "Event izin yang lebih lama dari entri terakhir tidak memicu .needsPermission")
+
+    // 3. tool_result setelah event izin -> kembali normal
+    let toolResultEntry = ("""
+    {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"All tests passed"}]},"timestamp":"2026-10-16T10:00:05.000Z"}
+    """ + "\n").data(using: .utf8)!
+    if let handle = FileHandle(forWritingAtPath: sessionPath) {
+        handle.seekToEndOfFile()
+        handle.write(toolResultEntry)
+        try? handle.close()
+    }
+    transcript.update()
+
+    let afterResultTime = ISODate.parse("2026-10-16T10:00:06.000Z")!
+    let sAfterResult = transcript.session(now: afterResultTime, modified: afterResultTime, permissionEvent: permEventNewer)
+    check(sAfterResult?.state != .needsPermission, "Setelah tool_result masuk, status kembali normal (bukan .needsPermission)")
+    checkEqual(sAfterResult?.state, .working, "Status kembali menjadi .working ('Berpikir...') setelah tool ditutup")
+
+    // 4. Test provider integration: idle_prompt diabaikan dan session_id lain tidak berpengaruh
+    let eventsPath = tempDir.appendingPathComponent("events.jsonl").path
+    let projectsDir = tempDir.appendingPathComponent("projects")
+    let projectSubdir = projectsDir.appendingPathComponent("my-project")
+    try? FileManager.default.createDirectory(at: projectSubdir, withIntermediateDirectories: true)
+
+    let activeSessionPath = projectSubdir.appendingPathComponent("active-session.jsonl").path
+    try? initialTranscript.write(to: URL(fileURLWithPath: activeSessionPath))
+
+    // Tulis event Notification idle_prompt (harus diabaikan)
+    let idlePromptEvent = """
+    {"received_at":"2026-10-16T10:00:03.000Z","event":"Notification","session_id":"active-session","notification_type":"idle_prompt","message":"Claude sedang menganggur"}
+    """.data(using: .utf8)!
+    try? (idlePromptEvent + Data([0x0A])).write(to: URL(fileURLWithPath: eventsPath))
+
+    let provider = ClaudeCodeProvider(root: projectsDir, eventsPath: eventsPath)
+    let context1 = PollContext(now: now, processes: [], loop: nil)
+    let sessions1 = provider.poll(context1)
+    let activeSession1 = sessions1.first { $0.id == "claude:active-session" }
+    check(activeSession1?.state != .needsPermission, "Event Notification idle_prompt diabaikan oleh provider")
+
+    // Tulis event PermissionRequest tetapi untuk session_id yang berbeda
+    let otherSessionEvent = """
+    {"received_at":"2026-10-16T10:00:04.000Z","event":"PermissionRequest","session_id":"different-session","tool_name":"Bash","tool_summary":"git push"}
+    """.data(using: .utf8)!
+    if let handle = FileHandle(forWritingAtPath: eventsPath) {
+        handle.seekToEndOfFile()
+        handle.write(otherSessionEvent + Data([0x0A]))
+        try? handle.close()
+    }
+
+    let sessions2 = provider.poll(context1)
+    let activeSession2 = sessions2.first { $0.id == "claude:active-session" }
+    check(activeSession2?.state != .needsPermission, "Event izin dari session_id lain tidak mempengaruhi active-session")
+
+    // Sekarang tulis event PermissionRequest untuk active-session
+    let targetSessionEvent = """
+    {"received_at":"2026-10-16T10:00:05.000Z","event":"PermissionRequest","session_id":"active-session","tool_name":"Bash","tool_summary":"npm test"}
+    """.data(using: .utf8)!
+    if let handle = FileHandle(forWritingAtPath: eventsPath) {
+        handle.seekToEndOfFile()
+        handle.write(targetSessionEvent + Data([0x0A]))
+        try? handle.close()
+    }
+
+    let sessions3 = provider.poll(context1)
+    let activeSession3 = sessions3.first { $0.id == "claude:active-session" }
+    checkEqual(activeSession3?.state, .needsPermission, "active-session beralih ke .needsPermission setelah event izin yang cocok tiba")
+
+    // 5. Syarat hasOpenTools: event izin lebih baru tetapi tidak ada tool terbuka -> bukan .needsPermission (#23)
+    let noToolSessionPath = tempDir.appendingPathComponent("session-no-open-tool.jsonl").path
+    let noToolTranscript = ("""
+    {"type":"user","message":{"role":"user","content":"Halo"},"timestamp":"2026-10-16T10:00:00.000Z"}
+    {"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Halo juga!"}]},"timestamp":"2026-10-16T10:00:02.000Z"}
+    """ + "\n").data(using: .utf8)!
+    try? noToolTranscript.write(to: URL(fileURLWithPath: noToolSessionPath))
+
+    let transcriptNoTool = ClaudeTranscript(path: noToolSessionPath)
+    transcriptNoTool.update()
+    let permEventNoTool = HookPermissionEvent(
+        sessionId: "session-no-open-tool",
+        receivedAt: ISODate.parse("2026-10-16T10:00:03.000Z")!,
+        toolName: "Bash",
+        toolSummary: "ls"
+    )
+    let sNoOpenTool = transcriptNoTool.session(
+        now: now,
+        modified: ISODate.parse("2026-10-16T10:00:02.000Z")!,
+        permissionEvent: permEventNoTool
+    )
+    check(sNoOpenTool?.state != .needsPermission, "Event izin lebih baru tetapi tidak ada tool terbuka -> bukan .needsPermission")
+    checkEqual(sNoOpenTool?.state, .waiting, "Sesi tanpa open tools tetap .waiting meskipun ada event izin baru")
+
+    // Verifikasi single source of truth path ~/.agent-monitor (#23)
+    checkEqual(MonitorModel.agentMonitorDirectory, HookHandler.defaultDirectory, "MonitorModel menggunakan HookHandler.defaultDirectory")
+    check(FileWatcher.defaultDirectories.contains(HookHandler.defaultDirectory), "FileWatcher.defaultDirectories menyertakan HookHandler.defaultDirectory")
+
+    // 6. Uji subdetik: tool_use di …05.800Z dan event di …05.950Z (ditulis via processInput) -> .needsPermission (#17)
+    let subsecondSessionPath = projectSubdir.appendingPathComponent("session-subsecond.jsonl").path
+    let subsecondTranscriptContent = ("""
+    {"type":"user","message":{"role":"user","content":"Run build"},"timestamp":"2026-10-16T10:00:00.000Z"}
+    {"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_sub_1","name":"Bash","input":{"command":"make build"}}]},"timestamp":"2026-10-16T10:00:05.800Z"}
+    """ + "\n").data(using: .utf8)!
+    try? subsecondTranscriptContent.write(to: URL(fileURLWithPath: subsecondSessionPath))
+
+    let subsecondPayload = """
+    {
+      "hook_event_name": "PermissionRequest",
+      "session_id": "session-subsecond",
+      "cwd": "\(projectSubdir.path)",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "make build"
+      }
+    }
+    """.data(using: .utf8)!
+
+    let subsecondEventTime = ISODate.parse("2026-10-16T10:00:05.950Z")!
+    HookHandler.processInput(subsecondPayload, receivedAt: subsecondEventTime, directory: tempDir)
+
+    let subsecondPollContext = PollContext(now: ISODate.parse("2026-10-16T10:00:20.000Z")!, processes: [], loop: nil)
+    let subsecondSessions = provider.poll(subsecondPollContext)
+    let subsecondSession = subsecondSessions.first { $0.id == "claude:session-subsecond" }
+    checkEqual(subsecondSession?.state, .needsPermission, "Event izin 05.950Z (via processInput) lebih baru dari tool_use 05.800Z menghasilkan .needsPermission")
+}
+
+func testPendingNotificationsDecision() {
+    let sWorking = AgentSession(
+        id: "s1", kind: .claudeCode, title: "Proyek A", state: .working, detail: "Menjalankan bash"
+    )
+    let sNeedsPerm = AgentSession(
+        id: "s1", kind: .claudeCode, title: "Proyek A", state: .needsPermission, detail: "Minta izin: Bash — npm test"
+    )
+    let sWaiting = AgentSession(
+        id: "s1", kind: .claudeCode, title: "Proyek A", state: .waiting, detail: "Menunggu respons prompt"
+    )
+
+    // 1. Pass pertama (primed = false) -> tidak ada notifikasi
+    let firstPass = MonitorModel.pendingNotifications(
+        currentSessions: [sNeedsPerm],
+        previousSessions: ["s1": sWorking],
+        currentLoop: nil,
+        previousLoopStatus: nil,
+        primed: false,
+        notificationsOn: true
+    )
+    check(firstPass.isEmpty, "Pass pertama (primed = false) tidak menghasilkan notifikasi")
+
+    // 2. notificationsOn = false -> tidak ada notifikasi
+    let offPass = MonitorModel.pendingNotifications(
+        currentSessions: [sNeedsPerm],
+        previousSessions: ["s1": sWorking],
+        currentLoop: nil,
+        previousLoopStatus: nil,
+        primed: true,
+        notificationsOn: false
+    )
+    check(offPass.isEmpty, "Saat notificationsOn = false, tidak ada notifikasi")
+
+    // 3. Transisi .working -> .needsPermission -> notifikasi "Claude Code butuh izin"
+    let permNotifications = MonitorModel.pendingNotifications(
+        currentSessions: [sNeedsPerm],
+        previousSessions: ["s1": sWorking],
+        currentLoop: nil,
+        previousLoopStatus: nil,
+        primed: true,
+        notificationsOn: true
+    )
+    checkEqual(permNotifications.count, 1, "Tepat satu notifikasi untuk working -> needsPermission")
+    checkEqual(permNotifications.first?.title, "Claude Code butuh izin", "Judul notifikasi 'Claude Code butuh izin'")
+    checkEqual(permNotifications.first?.message, "Proyek A: Minta izin: Bash — npm test", "Isi notifikasi '<judul>: <detail>'")
+
+    // 4. Transisi .needsPermission -> .waiting -> notifikasi "Claude Code menunggu Anda"
+    let waitFromPermNotifications = MonitorModel.pendingNotifications(
+        currentSessions: [sWaiting],
+        previousSessions: ["s1": sNeedsPerm],
+        currentLoop: nil,
+        previousLoopStatus: nil,
+        primed: true,
+        notificationsOn: true
+    )
+    checkEqual(waitFromPermNotifications.count, 1, "Tepat satu notifikasi untuk needsPermission -> waiting")
+    checkEqual(waitFromPermNotifications.first?.title, "Claude Code menunggu Anda", "Judul notifikasi 'Claude Code menunggu Anda'")
+    checkEqual(waitFromPermNotifications.first?.message, "Proyek A: Menunggu respons prompt", "Isi notifikasi '<judul>: <detail>'")
+
+    // 5. Transisi .working -> .waiting -> notifikasi "Claude Code menunggu Anda"
+    let waitFromWorkNotifications = MonitorModel.pendingNotifications(
+        currentSessions: [sWaiting],
+        previousSessions: ["s1": sWorking],
+        currentLoop: nil,
+        previousLoopStatus: nil,
+        primed: true,
+        notificationsOn: true
+    )
+    checkEqual(waitFromWorkNotifications.count, 1, "Tepat satu notifikasi untuk working -> waiting")
+    checkEqual(waitFromWorkNotifications.first?.title, "Claude Code menunggu Anda", "Judul notifikasi 'Claude Code menunggu Anda'")
+}
+
+func testAgentStateAndCanDismiss() {
+    // 1. Urutan state: needsPermission paling atas
+    check(AgentState.needsPermission < AgentState.waiting, ".needsPermission lebih prioritas dari .waiting")
+    check(AgentState.waiting < AgentState.working, ".waiting lebih prioritas dari .working")
+    checkEqual(AgentState.needsPermission.rawValue, 0, "RawValue .needsPermission adalah 0 (teratas)")
+
+    // 2. Label
+    checkEqual(AgentState.needsPermission.label, "Butuh izin", "Label .needsPermission adalah 'Butuh izin'")
+
+    // 3. canDismiss
+    let sPerm = AgentSession(id: "1", kind: .claudeCode, title: "T", state: .needsPermission)
+    checkEqual(sPerm.canDismiss, false, "canDismiss bernilai false untuk .needsPermission")
+
+    let sWork = AgentSession(id: "2", kind: .claudeCode, title: "T", state: .working)
+    checkEqual(sWork.canDismiss, false, "canDismiss bernilai false untuk .working")
+
+    let sWait = AgentSession(id: "3", kind: .claudeCode, title: "T", state: .waiting)
+    checkEqual(sWait.canDismiss, true, "canDismiss bernilai true untuk .waiting")
+
+    let sIdle = AgentSession(id: "4", kind: .claudeCode, title: "T", state: .idle)
+    checkEqual(sIdle.canDismiss, true, "canDismiss bernilai true untuk .idle")
+
+    let sFinished = AgentSession(id: "5", kind: .claudeCode, title: "T", state: .finished)
+    checkEqual(sFinished.canDismiss, true, "canDismiss bernilai true untuk .finished")
+
+    let sFailed = AgentSession(id: "6", kind: .claudeCode, title: "T", state: .failed)
+    checkEqual(sFailed.canDismiss, true, "canDismiss bernilai true untuk .failed")
+
+    let sRunning = AgentSession(id: "7", kind: .claudeCode, title: "T", state: .running)
+    checkEqual(sRunning.canDismiss, true, "canDismiss bernilai true untuk .running")
+}
+
+func testSessionJumper() {
+    let syntheticPs = """
+        1     0 ??       /sbin/launchd
+      700     1 ??       /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+      701   700 ttys003  /usr/bin/login
+      702   701 ttys003  -zsh
+      703   702 ttys003  /Users/dev/.local/bin/claude
+      800     1 ??       /Applications/iTerm.app/Contents/MacOS/iTerm2
+      801   800 ttys005  -zsh
+      802   801 ttys005  /opt/homebrew/bin/codex
+      900     1 ??       /Applications/Visual Studio Code.app/Contents/MacOS/Electron
+      901   900 ??       /Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)
+      902   901 ??       /Users/dev/.vscode/extensions/anthropic.claude-code-2.1.0-darwin-arm64/resources/native-binary/claude
+      950     1 ??       /Applications/Cursor.app/Contents/MacOS/Cursor
+      951   950 ??       /Users/dev/.cursor/extensions/anthropic.claude-code/claude
+      600     1 ??       /usr/sbin/cron
+      601   600 ??       /usr/local/bin/claude
+    """
+
+    // 1. Parsing output ps menjadi tree
+    let tree = SessionJumper.parseProcessTree(syntheticPs)
+    checkEqual(tree.count, 15, "Seluruh 15 baris ps sintetis berhasil di-parse")
+    checkEqual(tree[703]?.comm, "/Users/dev/.local/bin/claude", "comm proses 703 terbaca benar")
+    checkEqual(tree[703]?.ppid, 702, "ppid proses 703 adalah 702")
+    checkEqual(tree[703]?.tty, "ttys003", "tty proses 703 adalah ttys003")
+    checkEqual(tree[902]?.tty, nil, "tty '??' disimpan sebagai nil")
+
+    // 2. Outermost .app bundle path extractor
+    let nestedPath = "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"
+    checkEqual(SessionJumper.outermostAppPath(from: nestedPath), "/Applications/Visual Studio Code.app", "Mengambil bundle .app terluar dari path bersarang")
+    checkEqual(SessionJumper.outermostAppPath(from: "-zsh"), nil, "Bukan path .app menghasilkan nil")
+
+    // 3. Menelusuri rantai parent untuk menemukan host .app
+    // Kasus 1: Terminal
+    let hostTerminal = SessionJumper.findHostApp(for: 703, in: tree)
+    checkEqual(hostTerminal?.bundleId, "com.apple.Terminal", "Host untuk proses 703 adalah com.apple.Terminal")
+    checkEqual(hostTerminal?.appPath, "/System/Applications/Utilities/Terminal.app", "Path host Terminal benar")
+    checkEqual(hostTerminal?.pid, 700, "PID host Terminal adalah 700")
+
+    // Kasus 2: iTerm2
+    let hostIterm = SessionJumper.findHostApp(for: 802, in: tree)
+    checkEqual(hostIterm?.bundleId, "com.googlecode.iterm2", "Host untuk proses 802 adalah com.googlecode.iterm2")
+    checkEqual(hostIterm?.appPath, "/Applications/iTerm.app", "Path host iTerm2 benar")
+    checkEqual(hostIterm?.pid, 800, "PID host iTerm2 adalah 800")
+
+    // Kasus 3: VS Code (proses ekstensi tanpa TTY)
+    let hostVSCode = SessionJumper.findHostApp(for: 902, in: tree)
+    checkEqual(hostVSCode?.bundleId, "com.microsoft.VSCode", "Host untuk proses 902 adalah com.microsoft.VSCode")
+    checkEqual(hostVSCode?.appPath, "/Applications/Visual Studio Code.app", "Path host VS Code benar")
+    checkEqual(hostVSCode?.pid, 900, "PID host VS Code terluar adalah 900")
+
+    // Kasus Cursor
+    let hostCursor = SessionJumper.findHostApp(for: 951, in: tree)
+    checkEqual(hostCursor?.bundleId, "com.todesktop.230313mzl4w4u92", "Host untuk proses 951 adalah Cursor bundle ID")
+    checkEqual(hostCursor?.appPath, "/Applications/Cursor.app", "Path host Cursor benar")
+
+    // Kasus 4: Tidak ada host (cron / daemon)
+    let hostNone = SessionJumper.findHostApp(for: 601, in: tree)
+    check(hostNone == nil, "Proses tanpa host .app menghasilkan host nil")
+
+    // 4. Pencocokan sesi dengan proses berdasarkan cwd
+    let project = "/Users/dev/contoh-proyek"
+    check(SessionJumper.matchesProject(processCwd: "/Users/dev/contoh-proyek", projectPath: project), "cwd persis sama cocok")
+    check(SessionJumper.matchesProject(processCwd: "/Users/dev/contoh-proyek/src/nested", projectPath: project), "cwd di dalam subfolder cocok")
+    check(!SessionJumper.matchesProject(processCwd: "/Users/dev/contoh-proyek-2", projectPath: project), "cwd prefix mirip tetapi beda folder tidak cocok")
+    check(!SessionJumper.matchesProject(processCwd: "/Users/dev/proyek-lain", projectPath: project), "cwd berbeda tidak cocok")
+
+    // Beberapa kandidat: yang ber-TTY dipilih
+    let candNoTTY = ProcessTreeEntry(pid: 101, ppid: 1, tty: nil, comm: "/usr/local/bin/claude")
+    let candWithTTY = ProcessTreeEntry(pid: 102, ppid: 1, tty: "ttys003", comm: "/usr/local/bin/claude")
+    let bestCand = SessionJumper.pickBestProcess(
+        candidates: [candNoTTY, candWithTTY],
+        projectPath: project,
+        cwdSupplier: { _ in project }
+    )
+    checkEqual(bestCand?.pid, 102, "Kandidat dengan TTY diprioritaskan saat keduanya cocok cwd")
+
+    // 5. String AppleScript untuk Terminal dan iTerm2
+    let termScript = SessionJumper.terminalAppleScript(for: "ttys003")
+    check(termScript.contains("\"/dev/ttys003\""), "AppleScript Terminal memuat TTY berformat /dev/ttys003")
+    check(termScript.contains("set selected of t to true"), "AppleScript Terminal memilih tab")
+    check(termScript.contains("set index of w to 1"), "AppleScript Terminal memajukan jendela")
+
+    let itermScript = SessionJumper.itermAppleScript(for: "ttys005")
+    check(itermScript.contains("\"/dev/ttys005\""), "AppleScript iTerm2 memuat TTY berformat /dev/ttys005")
+    check(itermScript.contains("select t"), "AppleScript iTerm2 memilih tab")
+    check(itermScript.contains("select s"), "AppleScript iTerm2 memilih session")
+
+    // Keamanan terhadap tanda kutip
+    let quoteEscapedScript = SessionJumper.terminalAppleScript(for: "ttys\"001")
+    check(quoteEscapedScript.contains("/dev/ttys\\\"001"), "Tanda kutip ganda di TTY di-escape dengan aman")
+
+    // 6. Pemilihan aksi (determineAction)
+    // Terminal + TTY
+    let actTerm = SessionJumper.determineAction(host: hostTerminal, tty: "ttys003", projectPath: project)
+    if case .terminal(let s) = actTerm {
+        check(s.contains("/dev/ttys003"), "Aksi Terminal menghasilkan .terminal dengan script")
+    } else {
+        check(false, "Ekspektasi aksi .terminal")
+    }
+
+    // iTerm2 + TTY
+    let actIterm = SessionJumper.determineAction(host: hostIterm, tty: "ttys005", projectPath: project)
+    if case .iterm(let s) = actIterm {
+        check(s.contains("/dev/ttys005"), "Aksi iTerm2 menghasilkan .iterm dengan script")
+    } else {
+        check(false, "Ekspektasi aksi .iterm")
+    }
+
+    // Terminal tanpa TTY -> activateApp
+    let actTermNoTTY = SessionJumper.determineAction(host: hostTerminal, tty: nil, projectPath: project)
+    checkEqual(actTermNoTTY, .activateApp(pid: 700), "Terminal tanpa TTY menghasilkan .activateApp")
+
+    // iTerm2 tanpa TTY -> activateApp
+    let actItermNoTTY = SessionJumper.determineAction(host: hostIterm, tty: nil, projectPath: project)
+    checkEqual(actItermNoTTY, .activateApp(pid: 800), "iTerm2 tanpa TTY menghasilkan .activateApp")
+
+    // VS Code -> openProject
+    let actVSCode = SessionJumper.determineAction(host: hostVSCode, tty: nil, projectPath: project)
+    checkEqual(actVSCode, .openProject(bundleId: "com.microsoft.VSCode", path: project), "VS Code menghasilkan .openProject dengan bundle id com.microsoft.VSCode")
+
+    // Cursor -> openProject
+    let actCursor = SessionJumper.determineAction(host: hostCursor, tty: nil, projectPath: project)
+    checkEqual(actCursor, .openProject(bundleId: "com.todesktop.230313mzl4w4u92", path: project), "Cursor menghasilkan .openProject dengan bundle id Cursor")
+
+    // Host lain -> activateApp
+    let otherHost = HostAppInfo(pid: 300, bundleId: "com.alacritty", appPath: "/Applications/Alacritty.app")
+    let actOther = SessionJumper.determineAction(host: otherHost, tty: nil, projectPath: project)
+    checkEqual(actOther, .activateApp(pid: 300), "Host lain menghasilkan .activateApp")
+
+    // Host nil / tidak ditemukan -> notFound
+    let actNotFound = SessionJumper.determineAction(host: nil, tty: nil, projectPath: project)
+    checkEqual(actNotFound, .notFound, "Host nil menghasilkan .notFound")
+
+    // 7. resolveAction dengan injeksi supplier (tanpa memanggil proses sungguhan)
+    let cwds: [Int: String] = [
+        703: project,
+        802: project,
+        902: project,
+        951: project
+    ]
+    let resolvedTerm = SessionJumper.resolveAction(
+        forKind: .claudeCode,
+        projectPath: project,
+        processTreeSupplier: { syntheticPs },
+        cwdSupplier: { cwds[$0] }
+    )
+    if case .terminal = resolvedTerm {
+        check(true, "resolveAction berhasil mendeteksi Terminal via supplier injeksi")
+    } else {
+        check(false, "resolveAction gagal mendeteksi Terminal")
+    }
+
+    let resolvedCodex = SessionJumper.resolveAction(
+        forKind: .codex,
+        projectPath: project,
+        processTreeSupplier: { syntheticPs },
+        cwdSupplier: { cwds[$0] }
+    )
+    if case .iterm = resolvedCodex {
+        check(true, "resolveAction berhasil mendeteksi iTerm2 untuk Codex via supplier injeksi")
+    } else {
+        check(false, "resolveAction gagal mendeteksi iTerm2")
+    }
+
+    let resolvedNotFound = SessionJumper.resolveAction(
+        forKind: .claudeCode,
+        projectPath: "/Users/dev/unmatched-project",
+        processTreeSupplier: { syntheticPs },
+        cwdSupplier: { cwds[$0] }
+    )
+    checkEqual(resolvedNotFound, .notFound, "resolveAction menghasilkan .notFound jika tidak ada proses cocok")
+
+    // 8. canJump property
+    let sClaude = AgentSession(id: "c1", kind: .claudeCode, title: "Claude", project: project, state: .working)
+    check(sClaude.canJump, "canJump bernilai true untuk Claude Code dengan project")
+    let sCodex = AgentSession(id: "x1", kind: .codex, title: "Codex", project: project, state: .waiting)
+    check(sCodex.canJump, "canJump bernilai true untuk Codex dengan project")
+    let sNoProj = AgentSession(id: "c2", kind: .claudeCode, title: "Claude", project: nil, state: .running)
+    check(!sNoProj.canJump, "canJump bernilai false jika project nil")
+    let sGemini = AgentSession(id: "g1", kind: .geminiCLI, title: "Gemini", project: project, state: .working)
+    check(!sGemini.canJump, "canJump bernilai false untuk Gemini CLI")
+    let sOllama = AgentSession(id: "o1", kind: .ollama, title: "Ollama", state: .running)
+    check(!sOllama.canJump, "canJump bernilai false untuk Ollama")
+}
+
+func testNotificationActions() {
+    // 1. Pemilihan kategori untuk setiap kombinasi state × canJump
+    // - .needsPermission
+    let itemPermJump = MonitorModel.NotificationItem(
+        title: "Claude Code butuh izin", message: "detail", agentId: "c1", kind: .claudeCode, state: .needsPermission, canJump: true
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemPermJump), NotificationCategoryIdentifier.needsPermissionJump, "Kategori .needsPermission + canJump adalah needsPermissionJump")
+
+    let itemPermNoJump = MonitorModel.NotificationItem(
+        title: "Claude Code butuh izin", message: "detail", agentId: "c1", kind: .claudeCode, state: .needsPermission, canJump: false
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemPermNoJump), NotificationCategoryIdentifier.needsPermissionNoJump, "Kategori .needsPermission + noJump adalah needsPermissionNoJump")
+
+    // - .waiting
+    let itemWaitJump = MonitorModel.NotificationItem(
+        title: "Claude Code menunggu Anda", message: "detail", agentId: "c1", kind: .claudeCode, state: .waiting, canJump: true
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemWaitJump), NotificationCategoryIdentifier.actionableJump, "Kategori .waiting + canJump adalah actionableJump")
+
+    let itemWaitNoJump = MonitorModel.NotificationItem(
+        title: "Claude Code menunggu Anda", message: "detail", agentId: "c1", kind: .claudeCode, state: .waiting, canJump: false
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemWaitNoJump), NotificationCategoryIdentifier.actionableNoJump, "Kategori .waiting + noJump adalah actionableNoJump")
+
+    // - .failed
+    let itemFailJump = MonitorModel.NotificationItem(
+        title: "Claude Code error", message: "detail", agentId: "c1", kind: .claudeCode, state: .failed, canJump: true
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemFailJump), NotificationCategoryIdentifier.actionableJump, "Kategori .failed + canJump adalah actionableJump")
+
+    let itemFailNoJump = MonitorModel.NotificationItem(
+        title: "Claude Code error", message: "detail", agentId: "c1", kind: .claudeCode, state: .failed, canJump: false
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemFailNoJump), NotificationCategoryIdentifier.actionableNoJump, "Kategori .failed + noJump adalah actionableNoJump")
+
+    // - .finished
+    let itemFinJump = MonitorModel.NotificationItem(
+        title: "Claude Code selesai", message: "detail", agentId: "c1", kind: .claudeCode, state: .finished, canJump: true
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemFinJump), NotificationCategoryIdentifier.actionableJump, "Kategori .finished + canJump adalah actionableJump")
+
+    let itemFinNoJump = MonitorModel.NotificationItem(
+        title: "Claude Code selesai", message: "detail", agentId: "c1", kind: .claudeCode, state: .finished, canJump: false
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemFinNoJump), NotificationCategoryIdentifier.actionableNoJump, "Kategori .finished + noJump adalah actionableNoJump")
+
+    // - .working, .idle, .running -> tanpa aksi (nil)
+    for state in [AgentState.working, AgentState.idle, AgentState.running] {
+        let itJump = MonitorModel.NotificationItem(
+            title: "T", message: "M", agentId: "c1", kind: .claudeCode, state: state, canJump: true
+        )
+        let itNoJump = MonitorModel.NotificationItem(
+            title: "T", message: "M", agentId: "c1", kind: .claudeCode, state: state, canJump: false
+        )
+        checkEqual(Notifier.categoryIdentifier(for: itJump), nil, "Kategori state \(state) + canJump adalah nil")
+        checkEqual(Notifier.categoryIdentifier(for: itNoJump), nil, "Kategori state \(state) + noJump adalah nil")
+    }
+
+    // - Loop notification -> tanpa aksi (nil)
+    let itemLoop = MonitorModel.NotificationItem(
+        title: "Loop my-project: Claude", message: "subtitle", agentId: nil, kind: nil, state: nil, canJump: false
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemLoop), nil, "Kategori notifikasi loop adalah nil")
+
+    // - Gemini CLI berhenti -> tanpa aksi (nil)
+    let itemGeminiStop = MonitorModel.NotificationItem(
+        title: "Gemini CLI berhenti", message: "prompt", agentId: "g1", kind: .geminiCLI, state: nil, canJump: false
+    )
+    checkEqual(Notifier.categoryIdentifier(for: itemGeminiStop), nil, "Kategori 'Gemini CLI berhenti' adalah nil")
+
+    // 2. Pemetaan identifier aksi (resolveAction)
+    // - Buka ("open")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.open, agentId: "c1", canJump: true), .jump(agentId: "c1"), "Action 'open' dengan canJump true menghasilkan .jump")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.open, agentId: "c1", canJump: false), .openPanel, "Action 'open' dengan canJump false menghasilkan .openPanel")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.open, agentId: nil, canJump: false), .openPanel, "Action 'open' tanpa agentId menghasilkan .openPanel")
+
+    // - Klik pada isi notifikasi (UNNotificationDefaultActionIdentifier)
+    checkEqual(Notifier.resolveAction(actionIdentifier: UNNotificationDefaultActionIdentifier, agentId: "c1", canJump: true), .jump(agentId: "c1"), "Default action dengan canJump true menghasilkan .jump")
+    checkEqual(Notifier.resolveAction(actionIdentifier: UNNotificationDefaultActionIdentifier, agentId: "c1", canJump: false), .openPanel, "Default action dengan canJump false menghasilkan .openPanel")
+    checkEqual(Notifier.resolveAction(actionIdentifier: UNNotificationDefaultActionIdentifier, agentId: nil, canJump: false), .openPanel, "Default action tanpa agentId menghasilkan .openPanel")
+
+    // - Tunda 10 mnt ("snooze")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.snooze, agentId: "c1", canJump: true), .snooze(agentId: "c1"), "Action 'snooze' dengan agentId menghasilkan .snooze")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.snooze, agentId: nil, canJump: false), .none, "Action 'snooze' tanpa agentId menghasilkan .none")
+
+    // - Tutup pantauan ("dismiss")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.dismiss, agentId: "c1", canJump: true), .dismiss(agentId: "c1"), "Action 'dismiss' dengan agentId menghasilkan .dismiss")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.dismiss, agentId: nil, canJump: false), .none, "Action 'dismiss' tanpa agentId menghasilkan .none")
+
+    // - Identifier tak dikenal & swipe away -> .none
+    checkEqual(Notifier.resolveAction(actionIdentifier: "unknown_identifier", agentId: "c1", canJump: true), .none, "Identifier tak dikenal menghasilkan .none")
+    checkEqual(Notifier.resolveAction(actionIdentifier: UNNotificationDismissActionIdentifier, agentId: "c1", canJump: true), .none, "Dismiss identifier sistem menghasilkan .none")
+
+    // - Pemetaan via userInfo
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.open, userInfo: ["agentId": "c1", "canJump": true]), .jump(agentId: "c1"), "resolveAction via userInfo untuk 'open' + canJump")
+    checkEqual(Notifier.resolveAction(actionIdentifier: UNNotificationDefaultActionIdentifier, userInfo: ["agentId": "c1", "canJump": false]), .openPanel, "resolveAction via userInfo untuk default action + noJump")
+    checkEqual(Notifier.resolveAction(actionIdentifier: UNNotificationDefaultActionIdentifier, userInfo: [:]), .openPanel, "resolveAction via userInfo kosong untuk default action")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.snooze, userInfo: ["agentId": "c1"]), .snooze(agentId: "c1"), "resolveAction via userInfo untuk 'snooze'")
+    checkEqual(Notifier.resolveAction(actionIdentifier: NotificationActionIdentifier.dismiss, userInfo: ["agentId": "c1"]), .dismiss(agentId: "c1"), "resolveAction via userInfo untuk 'dismiss'")
+    checkEqual(Notifier.resolveAction(actionIdentifier: "unknown", userInfo: ["agentId": "c1"]), .none, "resolveAction via userInfo untuk aksi tak dikenal")
+
+    // 3. pendingNotifications dengan snooze
+    let now = Date(timeIntervalSince1970: 1700000000)
+    let sWorking1 = AgentSession(id: "s1", kind: .claudeCode, title: "Proyek A", state: .working)
+    let sNeedsPerm1 = AgentSession(id: "s1", kind: .claudeCode, title: "Proyek A", state: .needsPermission, detail: "Izin Bash")
+    let sWorking2 = AgentSession(id: "s2", kind: .codex, title: "Proyek B", state: .working)
+    let sWaiting2 = AgentSession(id: "s2", kind: .codex, title: "Proyek B", state: .waiting, detail: "Menunggu masukan")
+
+    let loopJSON = """
+    {"project":"/Users/dev/proj","phase":"1","round":1,"status":"gemini","description":"Test"}
+    """
+    let loopState2 = try! JSONDecoder().decode(LoopState.self, from: Data(loopJSON.utf8))
+    let loop2 = LoopSnapshot(state: loopState2)
+
+    // - S1 ditunda selama 10 menit (600 dtk)
+    let snoozedMap = ["s1": now.addingTimeInterval(600)]
+
+    let notificationsNow = MonitorModel.pendingNotifications(
+        currentSessions: [sNeedsPerm1, sWaiting2],
+        previousSessions: ["s1": sWorking1, "s2": sWorking2],
+        currentLoop: loop2,
+        previousLoopStatus: "claude",
+        primed: true,
+        notificationsOn: true,
+        snoozedUntil: snoozedMap,
+        now: now
+    )
+
+    check(!notificationsNow.contains { $0.agentId == "s1" }, "Agen s1 yang ditunda tidak menghasilkan notifikasi pada waktu sekarang")
+    check(notificationsNow.contains { $0.agentId == "s2" }, "Agen s2 yang tidak ditunda tetap menghasilkan notifikasi")
+    check(notificationsNow.contains { $0.agentId == nil }, "Notifikasi loop tetap dihasilkan meski ada agen yang ditunda")
+
+    // - Setelah 10 menit berlalu (now + 601 detik), s1 menghasilkan notifikasi lagi
+    let nowAfter10 = now.addingTimeInterval(601)
+    let notificationsAfter = MonitorModel.pendingNotifications(
+        currentSessions: [sNeedsPerm1, sWaiting2],
+        previousSessions: ["s1": sWorking1, "s2": sWorking2],
+        currentLoop: loop2,
+        previousLoopStatus: "claude",
+        primed: true,
+        notificationsOn: true,
+        snoozedUntil: snoozedMap,
+        now: nowAfter10
+    )
+
+    check(notificationsAfter.contains { $0.agentId == "s1" }, "Setelah 10 menit berlalu, agen s1 menghasilkan notifikasi lagi")
+    check(notificationsAfter.contains { $0.agentId == "s2" }, "Agen s2 tetap menghasilkan notifikasi setelah 10 menit")
+    check(notificationsAfter.contains { $0.agentId == nil }, "Notifikasi loop tetap ada")
+
+    // 4. agentId dan threadIdentifier di NotificationItem
+    let itemS1 = notificationsAfter.first { $0.agentId == "s1" }
+    check(itemS1?.agentId == "s1", "agentId pada item bernilai 's1'")
+    checkEqual(itemS1?.threadIdentifier, "s1", "threadIdentifier pada item agen bernilai 's1'")
+
+    let itemLoopFound = notificationsAfter.first { $0.agentId == nil }
+    check(itemLoopFound?.agentId == nil, "agentId pada item loop bernilai nil")
+    checkEqual(itemLoopFound?.threadIdentifier, "loop", "threadIdentifier pada item loop bernilai 'loop'")
+
+    // 5. Verifikasi kategori dan aksi sistem
+    let categories = Notifier.makeCategories()
+    checkEqual(categories.count, 4, "Terdapat tepat 4 kategori notifikasi yang didaftarkan")
+    let catIds = Set(categories.map(\.identifier))
+    check(catIds.contains(NotificationCategoryIdentifier.needsPermissionJump), "Kategori needsPermissionJump terdaftar")
+    check(catIds.contains(NotificationCategoryIdentifier.needsPermissionNoJump), "Kategori needsPermissionNoJump terdaftar")
+    check(catIds.contains(NotificationCategoryIdentifier.actionableJump), "Kategori actionableJump terdaftar")
+    check(catIds.contains(NotificationCategoryIdentifier.actionableNoJump), "Kategori actionableNoJump terdaftar")
+}
+
 // MARK: - Main Execution
 
 print("========================================")
@@ -767,6 +1722,13 @@ runSuite("PresenceProvider", testPresenceProvider)
 runSuite("Ollama Parsing", testOllamaParsing)
 await runSuiteAsync("PollingEngine", testPollingEngine)
 await runSuiteAsync("FileWatcher", testFileWatcher)
+runSuite("HookHandler & Mode Hook", testHookHandler)
+runSuite("HookInstaller", testHookInstaller)
+runSuite("ClaudeCode Hook Status & needsPermission", testClaudeCodeHookStatusAndNeedsPermission)
+runSuite("Pending Notifications Decision", testPendingNotificationsDecision)
+runSuite("AgentState & canDismiss", testAgentStateAndCanDismiss)
+runSuite("SessionJumper & Lompat ke Sesi", testSessionJumper)
+runSuite("Aksi Notifikasi & Kategori", testNotificationActions)
 
 let duration = String(format: "%.3f", Date().timeIntervalSince(startTime))
 

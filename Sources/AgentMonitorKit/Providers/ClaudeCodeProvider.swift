@@ -1,18 +1,93 @@
 import Foundation
 
+/// A permission request or prompt event received via Claude Code hooks.
+package struct HookPermissionEvent: Sendable {
+    package let sessionId: String
+    package let receivedAt: Date
+    package let toolName: String?
+    package let toolSummary: String?
+    package let message: String?
+
+    package init(
+        sessionId: String,
+        receivedAt: Date,
+        toolName: String? = nil,
+        toolSummary: String? = nil,
+        message: String? = nil
+    ) {
+        self.sessionId = sessionId
+        self.receivedAt = receivedAt
+        self.toolName = toolName
+        self.toolSummary = toolSummary
+        self.message = message
+    }
+}
+
 /// Claude Code sessions, read from the transcripts in ~/.claude/projects/<project>/<session>.jsonl.
 package final class ClaudeCodeProvider: AgentProvider {
     /// Sessions whose transcript has not changed for this long are no longer shown.
     package static let window: TimeInterval = 30 * 60
 
-    private let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+    private let root: URL
+    private let eventsTail: JSONLTail
+    private var lastPermissionEvents: [String: HookPermissionEvent] = [:]
     private var transcripts: [String: ClaudeTranscript] = [:]
     private var recent: [String: Date] = [:]
     private var lastScan = Date.distantPast
 
+    package init(root: URL? = nil, eventsPath: String? = nil) {
+        self.root = root ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let events = eventsPath ?? HookHandler.defaultEventsURL.path
+        self.eventsTail = JSONLTail(path: events)
+    }
+
     package func poll(_ context: PollContext) -> [AgentSession] {
         let now = context.now
         let processes = context.processes
+
+        // Read any new permission hook events from events.jsonl
+        for line in eventsTail.readNewLines() {
+            guard let json = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                  let sessionId = json["session_id"] as? String,
+                  let dateStr = json["received_at"] as? String,
+                  let receivedAt = ISODate.parse(dateStr) else { continue }
+
+            let event = json["event"] as? String
+            let notifType = json["notification_type"] as? String
+
+            let isPerm: Bool
+            if event == "PermissionRequest" {
+                isPerm = true
+            } else if event == "Notification" && notifType == "permission_prompt" {
+                isPerm = true
+            } else {
+                isPerm = false
+            }
+
+            guard isPerm else { continue }
+
+            let perm = HookPermissionEvent(
+                sessionId: sessionId,
+                receivedAt: receivedAt,
+                toolName: json["tool_name"] as? String,
+                toolSummary: json["tool_summary"] as? String,
+                message: json["message"] as? String
+            )
+
+            if let existing = lastPermissionEvents[sessionId] {
+                if receivedAt >= existing.receivedAt {
+                    lastPermissionEvents[sessionId] = perm
+                }
+            } else {
+                lastPermissionEvents[sessionId] = perm
+            }
+        }
+
+        // Drop permission events that have exceeded the provider window
+        lastPermissionEvents = lastPermissionEvents.filter {
+            now.timeIntervalSince($0.value.receivedAt) < Self.window
+        }
+
         if now.timeIntervalSince(lastScan) >= 5 {
             recent = FileScan.recentFiles(in: FileScan.subdirectories(of: root), ext: "jsonl", within: Self.window, now: now)
             transcripts = transcripts.filter { recent[$0.key] != nil }
@@ -23,7 +98,12 @@ package final class ClaudeCodeProvider: AgentProvider {
             let transcript = transcripts[path] ?? ClaudeTranscript(path: path)
             transcripts[path] = transcript
             transcript.update()
-            return transcript.session(now: now, modified: FileScan.modificationDate(path) ?? scanned)
+            let perm = lastPermissionEvents[transcript.sessionId]
+            return transcript.session(
+                now: now,
+                modified: FileScan.modificationDate(path) ?? scanned,
+                permissionEvent: perm
+            )
         }
 
         if sessions.isEmpty {
@@ -53,7 +133,7 @@ package final class ClaudeTranscript {
     private var model: String?
     private var last: Last = .none
     private var lastText = ""
-    private var lastEntryAt: Date?
+    package private(set) var lastEntryAt: Date?
     private let activityLog = TranscriptActivityLog()
 
     package init(path: String) {
@@ -85,7 +165,7 @@ package final class ClaudeTranscript {
     }
 
     /// Nil once the session has been quiet longer than the provider window; the file itself may be touched later.
-    package func session(now: Date, modified: Date) -> AgentSession? {
+    package func session(now: Date, modified: Date, permissionEvent: HookPermissionEvent? = nil) -> AgentSession? {
         let lastAt = lastEntryAt ?? modified
         let age = now.timeIntervalSince(lastAt)
         guard age < ClaudeCodeProvider.window else { return nil }
@@ -94,22 +174,48 @@ package final class ClaudeTranscript {
         let running = activityLog.runningActivity
         let state: AgentState
         let detail: String
-        switch last {
-        case .turnEnded:
-            state = .waiting
-            detail = Format.snippet(lastText)
-        case .none:
-            state = .idle
-            detail = ""
-        case .prompt, .thinking, .toolUse:
-            state = age < 600 ? .working : .idle
-            if let running {
-                let elapsed = now.timeIntervalSince(running.startedAt)
-                detail = elapsed > 20
-                    ? "\(running.title) (\(Format.duration(elapsed))) · mungkin menunggu izin"
-                    : "\(running.title) \(Format.snippet(running.detail, limit: 80))"
+
+        let hasOpenTools = !activityLog.openTools.isEmpty
+        let isNeedsPermission: Bool
+        if let perm = permissionEvent,
+           hasOpenTools,
+           perm.receivedAt > lastAt {
+            isNeedsPermission = true
+        } else {
+            isNeedsPermission = false
+        }
+
+        if isNeedsPermission, let perm = permissionEvent {
+            state = .needsPermission
+            if let toolName = perm.toolName, !toolName.isEmpty {
+                if let summary = perm.toolSummary, !summary.isEmpty {
+                    detail = "Minta izin: \(toolName) — \(summary)"
+                } else {
+                    detail = "Minta izin: \(toolName)"
+                }
+            } else if let msg = perm.message, !msg.isEmpty {
+                detail = msg
             } else {
-                detail = "Berpikir…"
+                detail = "Minta izin"
+            }
+        } else {
+            switch last {
+            case .turnEnded:
+                state = .waiting
+                detail = Format.snippet(lastText)
+            case .none:
+                state = .idle
+                detail = ""
+            case .prompt, .thinking, .toolUse:
+                state = age < 600 ? .working : .idle
+                if let running {
+                    let elapsed = now.timeIntervalSince(running.startedAt)
+                    detail = elapsed > 20
+                        ? "\(running.title) (\(Format.duration(elapsed))) · mungkin menunggu izin"
+                        : "\(running.title) \(Format.snippet(running.detail, limit: 80))"
+                } else {
+                    detail = "Berpikir…"
+                }
             }
         }
 

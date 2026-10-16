@@ -4,7 +4,7 @@ import SwiftUI
 extension AgentState {
     var color: Color {
         switch self {
-        case .waiting: return .orange
+        case .waiting, .needsPermission: return .orange
         case .working: return .blue
         case .failed: return .red
         case .finished: return .green
@@ -198,9 +198,12 @@ package struct MonitorView: View {
 
     private var summary: String {
         var parts: [String] = []
-        if model.waitingCount > 0 { parts.append("\(model.waitingCount) menunggu Anda") }
+        let needsPermCount = model.agents.filter { $0.state == .needsPermission }.count
+        let waitCount = model.agents.filter { $0.state == .waiting }.count
+        if needsPermCount > 0 { parts.append("\(needsPermCount) butuh izin") }
+        if waitCount > 0 { parts.append("\(waitCount) menunggu Anda") }
         if model.workingCount > 0 { parts.append("\(model.workingCount) bekerja") }
-        let others = model.agents.count - model.waitingCount - model.workingCount
+        let others = model.agents.count - needsPermCount - waitCount - model.workingCount
         if others > 0 { parts.append("\(others) lainnya") }
         return parts.isEmpty ? "Tidak ada agen aktif" : parts.joined(separator: " · ")
     }
@@ -273,25 +276,60 @@ package struct MonitorView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 12) {
-            Toggle("Notifikasi", isOn: $model.notificationsOn)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Toggle("Notifikasi", isOn: $model.notificationsOn)
+                    .toggleStyle(.checkbox)
+                Toggle("Jalan saat login", isOn: Binding(
+                    get: { model.launchAtLogin },
+                    set: { model.setLaunchAtLogin($0) }
+                ))
                 .toggleStyle(.checkbox)
-            Toggle("Jalan saat login", isOn: Binding(
-                get: { model.launchAtLogin },
-                set: { model.setLaunchAtLogin($0) }
-            ))
-            .toggleStyle(.checkbox)
-            Toggle("Tampil di layar", isOn: Binding(
-                get: { panel.isVisible },
-                set: { panel.setVisible($0) }
-            ))
-            .toggleStyle(.checkbox)
-            .help("Tampilkan monitor sebagai jendela yang tetap di layar")
-            Spacer()
-            Button("Keluar") { NSApplication.shared.terminate(nil) }
-                .controlSize(.small)
+                if !inPanel {
+                    Toggle("Tampil di layar", isOn: Binding(
+                        get: { panel.isVisible },
+                        set: { panel.setVisible($0) }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .help("Tampilkan monitor sebagai jendela yang tetap di layar")
+                }
+                hookControl
+                Spacer()
+                Button("Keluar") { NSApplication.shared.terminate(nil) }
+                    .controlSize(.small)
+            }
+            if let error = model.hookErrorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
         }
         .font(.caption)
+    }
+
+    @ViewBuilder
+    private var hookControl: some View {
+        HStack(spacing: 4) {
+            Toggle("Hook Claude Code", isOn: Binding(
+                get: { model.hookStatus == .installed },
+                set: { shouldInstall in
+                    if shouldInstall {
+                        model.installHook()
+                    } else {
+                        model.uninstallHook()
+                    }
+                }
+            ))
+            .toggleStyle(.checkbox)
+            .disabled(model.hookStatus == .disabled)
+            .help("Hook dipasang di ~/.claude/settings.json dan backup dibuat dulu.")
+
+            if model.hookStatus == .disabled {
+                Text("(dinonaktifkan)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func binding(for id: String) -> Binding<Bool> {
@@ -307,7 +345,7 @@ package struct MonitorView: View {
 struct AgentRow: View {
     let agent: AgentSession
     @Binding var expanded: Bool
-    let model: MonitorModel
+    @ObservedObject var model: MonitorModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -335,7 +373,7 @@ struct AgentRow: View {
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(agent.state == .waiting ? Color.orange.opacity(0.12) : Color.primary.opacity(0.05))
+                .fill((agent.state == .waiting || agent.state == .needsPermission) ? Color.orange.opacity(0.12) : Color.primary.opacity(0.05))
         )
     }
 
@@ -400,10 +438,18 @@ struct AgentRow: View {
             }
             .padding(.leading, 30)
         }
-        if agent.logPath != nil || agent.project != nil {
+        if agent.canJump || agent.logPath != nil || agent.project != nil {
             HStack(spacing: 6) {
+                if agent.canJump {
+                    Button("Buka") { model.jump(to: agent.id) }
+                }
                 if let log = agent.logPath { Button("Log") { model.openLog(log) } }
                 if let project = agent.project { Button("Folder") { model.open(project) } }
+                if let error = model.jumpErrors[agent.id] {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
             }
             .controlSize(.small)
             .padding(.leading, 30)
